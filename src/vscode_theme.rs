@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use serde::Deserialize;
-use syntect::highlighting::{Color, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings};
+use syntect::highlighting::{
+    Color, ScopeSelectors, StyleModifier, Theme, ThemeItem, ThemeSettings,
+};
 
 #[derive(Debug, Deserialize)]
 struct VsCodeTheme {
@@ -43,7 +45,11 @@ pub fn theme_from_json(json: &str) -> Result<Theme, String> {
     let vs: VsCodeTheme = serde_json::from_str(json).map_err(|e| e.to_string())?;
 
     let mut settings = ThemeSettings::default();
-    if let Some(bg) = vs.colors.get("editor.background").and_then(|c| c.as_deref()) {
+    if let Some(bg) = vs
+        .colors
+        .get("editor.background")
+        .and_then(|c| c.as_deref())
+    {
         settings.background = parse_color(bg)?;
     }
     if let Some(fg) = vs
