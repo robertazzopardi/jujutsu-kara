@@ -21,12 +21,22 @@ jj config unset --user ui.diff-formatter   # if you pointed it at this tool
 # leave formatter as :color-words (jj default)
 
 jj config set --user ui.pager kara
+# Colored color-words collapses line rewrites into after-only dual lines (before
+# never reaches the pager). Kara paints add/del washes itself — keep jj uncolored:
+jj config set --user ui.color never
+```
+
+If you want jj’s own colors instead, keep `ui.color = "auto"` and force full
+before/after lines:
+
+```bash
+jj config set --user diff.color-words.max-inline-alternation 0
 ```
 
 One-shot:
 
 ```bash
-jj diff --color=always | kara --no-pager
+jj diff --color=never | kara --no-pager
 ```
 
 ## Unified / `--tool` (optional)

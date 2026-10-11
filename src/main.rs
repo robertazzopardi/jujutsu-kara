@@ -66,7 +66,13 @@ fn main() {
             if use_pager {
                 run_with_pager(cursor, &ps, &theme, word_underline)
             } else {
-                process(cursor, &mut io::stdout().lock(), &ps, &theme, word_underline)
+                process(
+                    cursor,
+                    &mut io::stdout().lock(),
+                    &ps,
+                    &theme,
+                    word_underline,
+                )
             }
         } else {
             let stdin = io::stdin();
@@ -74,7 +80,13 @@ fn main() {
             if use_pager {
                 run_with_pager(locked, &ps, &theme, word_underline)
             } else {
-                process(locked, &mut io::stdout().lock(), &ps, &theme, word_underline)
+                process(
+                    locked,
+                    &mut io::stdout().lock(),
+                    &ps,
+                    &theme,
+                    word_underline,
+                )
             }
         }
     })();

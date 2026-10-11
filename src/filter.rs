@@ -8,8 +8,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::ansi::{
-    DiffTone, color_words_display_payload, overlay_word_diff, split_ansi_at_stripped, strip_ansi,
-    underline_ranges,
+    DiffTone, color_words_display_payload, overlay_word_diff, split_ansi_at_stripped,
+    stitch_removes, strip_ansi, underline_ranges,
 };
 use crate::theme::{ADD_BG, DEL_BG, sgr_bg};
 
@@ -72,16 +72,19 @@ pub fn process(
                         Some(_) => DiffTone::Remove,
                         None => DiffTone::Add,
                     };
-                    // Delete-only lines are all "removed"; dual-sided lines inline old+new —
-                    // drop removed tokens so syntect sees valid right-side text.
+                    // Delete-only: keep removes in payload. Dual/add: syntect on right side,
+                    // then stitch removed (before) tokens back for inline before/after.
                     let keep_removes = bg == Some(DEL_BG);
-                    let (payload, under) =
+                    let (payload, under, removes) =
                         color_words_display_payload(line, payload_at, keep_removes, fallback);
                     let mut highlighted = syntax
                         .map(|syn| highlight_payload(ps, theme, syn, &payload))
                         .unwrap_or(payload);
                     if word_underline && !under.is_empty() {
                         highlighted = overlay_word_diff(&highlighted, &under);
+                    }
+                    if !removes.is_empty() {
+                        highlighted = stitch_removes(&highlighted, &removes);
                     }
                     write!(out, "{prefix}")?;
                     if let Some(bg) = bg {
@@ -250,7 +253,9 @@ fn path_from_color_words_header(stripped: &str) -> Option<&str> {
         &s[i + " file ".len()..]
     } else if let Some(rest) = s.strip_prefix("Renamed ") {
         rest
-    } else { s.strip_prefix("Copied ")? };
+    } else {
+        s.strip_prefix("Copied ")?
+    };
     if path.is_empty() {
         return None;
     }
@@ -469,10 +474,7 @@ Modified regular file main.rs:
             "expected syntect fg kept:\n{out}"
         );
         let off = run(input);
-        assert!(
-            !off.contains("\x1b[4m"),
-            "underline off by default:\n{off}"
-        );
+        assert!(!off.contains("\x1b[4m"), "underline off by default:\n{off}");
     }
 
     #[test]

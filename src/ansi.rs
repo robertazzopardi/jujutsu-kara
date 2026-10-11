@@ -108,19 +108,23 @@ pub fn underline_ranges(
     color_words_display_payload(original, payload_at, true, fallback).1
 }
 
-/// Payload text + underline ranges for color-words lines.
+/// `(right_text, underline_ranges, remove_inserts)` for [`stitch_removes`].
+type ColorWordsParts = (String, Vec<(usize, usize, DiffTone)>, Vec<(usize, String)>);
+
+/// Right-side payload + underline ranges (+ removed spans to stitch back for display).
 ///
 /// jj word-replacements emit removed then added tokens inline. When `keep_removes`
-/// is false (dual-sided / add-only), skip removed-tone chars so highlighting sees
-/// the right-hand line (`…highlight` + `kara` → `kara`).
+/// is false, removed chars are omitted from the payload (so syntect sees the right
+/// line) and returned as `(plain_index, text)` inserts for [`stitch_removes`].
 pub fn color_words_display_payload(
     original: &str,
     payload_at: usize,
     keep_removes: bool,
     fallback: DiffTone,
-) -> (String, Vec<(usize, usize, DiffTone)>) {
+) -> ColorWordsParts {
     let mut payload = String::new();
     let mut ranges = Vec::new();
+    let mut removes: Vec<(usize, String)> = Vec::new();
     let mut plain = 0usize; // all plain chars (incl. skipped)
     let mut out_i = 0usize; // kept payload chars only
     let mut underlined = false;
@@ -149,6 +153,10 @@ pub fn color_words_display_payload(
                             if underlined {
                                 span_tone = t;
                             }
+                        } else if sgr_clears_fg(&params) {
+                            // jj: `\x1b[38;5;1m…\x1b[39m` then uncolored text — without
+                            // this, Remove sticks and keep_removes=false drops the rest.
+                            tone = fallback;
                         }
                         apply_underline_sgr(
                             &params,
@@ -186,13 +194,80 @@ pub fn color_words_display_payload(
             continue;
         }
         if !keep_removes && tone == DiffTone::Remove {
+            match removes.last_mut() {
+                Some((i, s)) if *i == out_i => s.push(c),
+                _ => removes.push((out_i, c.to_string())),
+            }
             continue;
         }
         payload.push(c);
         out_i += 1;
     }
     close_underline(&mut ranges, &mut underlined, start, out_i, span_tone);
-    (payload, ranges)
+    (payload, ranges, removes)
+}
+
+/// Re-insert jj removed-tone spans into highlighted right-side text at plain offsets.
+pub fn stitch_removes(highlighted: &str, removes: &[(usize, String)]) -> String {
+    if removes.is_empty() {
+        return highlighted.to_string();
+    }
+    let mut out = String::with_capacity(
+        highlighted.len() + removes.iter().map(|(_, s)| s.len() + 16).sum::<usize>(),
+    );
+    let mut plain = 0usize;
+    let mut ri = 0usize;
+    let mut chars = highlighted.char_indices().peekable();
+
+    let flush = |out: &mut String, at: usize, ri: &mut usize| {
+        while *ri < removes.len() && removes[*ri].0 == at {
+            // jj default remove: underline + red fg
+            out.push_str("\x1b[4m\x1b[38;5;1m");
+            out.push_str(&removes[*ri].1);
+            out.push_str("\x1b[24m\x1b[39m");
+            *ri += 1;
+        }
+    };
+
+    while let Some((_, c)) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            match chars.peek().map(|(_, c)| *c) {
+                Some('[') => {
+                    out.push(chars.next().unwrap().1);
+                    for (_, c2) in chars.by_ref() {
+                        out.push(c2);
+                        if ('@'..='~').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    out.push(chars.next().unwrap().1);
+                    while let Some((_, c2)) = chars.next() {
+                        out.push(c2);
+                        if c2 == '\u{7}' {
+                            break;
+                        }
+                        if c2 == '\u{1b}' && chars.peek().map(|(_, c)| *c) == Some('\\') {
+                            out.push(chars.next().unwrap().1);
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    out.push(chars.next().unwrap().1);
+                }
+                None => {}
+            }
+            continue;
+        }
+        flush(&mut out, plain, &mut ri);
+        out.push(c);
+        plain += 1;
+    }
+    flush(&mut out, plain, &mut ri);
+    out
 }
 
 fn close_underline(
@@ -232,6 +307,10 @@ fn apply_underline_sgr(
     }
 }
 
+fn sgr_clears_fg(params: &str) -> bool {
+    params.is_empty() || params.split(';').any(|p| p == "0" || p == "39")
+}
+
 fn tone_from_sgr(params: &str) -> Option<DiffTone> {
     let parts: Vec<&str> = params.split(';').filter(|p| !p.is_empty()).collect();
     // 31/91 red, 32/92 green
@@ -245,25 +324,27 @@ fn tone_from_sgr(params: &str) -> Option<DiffTone> {
     // 38;5;n — jj defaults: 1 red, 2 green
     if let Some(i) = parts.iter().position(|&p| p == "38") {
         if parts.get(i + 1) == Some(&"5")
-            && let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
-                return match n {
-                    1 | 9 => Some(DiffTone::Remove),
-                    2 | 10 => Some(DiffTone::Add),
-                    _ => None,
-                };
-            }
+            && let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok())
+        {
+            return match n {
+                1 | 9 => Some(DiffTone::Remove),
+                2 | 10 => Some(DiffTone::Add),
+                _ => None,
+            };
+        }
         if parts.get(i + 1) == Some(&"2")
             && let (Some(r), Some(g), Some(_b)) = (
                 parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
                 parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
                 parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
-            ) {
-                return match g.cmp(&r) {
-                    std::cmp::Ordering::Greater => Some(DiffTone::Add),
-                    std::cmp::Ordering::Less => Some(DiffTone::Remove),
-                    std::cmp::Ordering::Equal => None,
-                };
-            }
+            )
+        {
+            return match g.cmp(&r) {
+                std::cmp::Ordering::Greater => Some(DiffTone::Add),
+                std::cmp::Ordering::Less => Some(DiffTone::Remove),
+                std::cmp::Ordering::Equal => None,
+            };
+        }
     }
     None
 }
@@ -294,9 +375,10 @@ pub fn overlay_word_diff(highlighted: &str, ranges: &[(usize, usize, DiffTone)])
                     }
                     // SGR can clear underline; re-assert style + underline color only.
                     if final_byte == 'm'
-                        && let Some(tone) = active {
-                            out.push_str(tone.underline_sgr());
-                        }
+                        && let Some(tone) = active
+                    {
+                        out.push_str(tone.underline_sgr());
+                    }
                 }
                 Some(']') => {
                     out.push(chars.next().unwrap().1);
@@ -306,10 +388,11 @@ pub fn overlay_word_diff(highlighted: &str, ranges: &[(usize, usize, DiffTone)])
                             break;
                         }
                         if c2 == '\u{1b}'
-                            && let Some((_, '\\')) = chars.peek().copied() {
-                                out.push(chars.next().unwrap().1);
-                                break;
-                            }
+                            && let Some((_, '\\')) = chars.peek().copied()
+                        {
+                            out.push(chars.next().unwrap().1);
+                            break;
+                        }
                     }
                 }
                 Some(_) => {
@@ -373,12 +456,29 @@ mod tests {
     fn color_words_drops_removed_half_of_word_replace() {
         // jj inlines old (red) + new (green) under one underline
         let line = "   1    1: pager \x1b[4m\x1b[38;5;1mjj-diff-syntax-highlight\x1b[38;5;2mkara\x1b[24m\x1b[39m";
-        let (payload, ranges) = color_words_display_payload(line, 10, false, DiffTone::Add);
+        let (payload, ranges, removes) =
+            color_words_display_payload(line, 10, false, DiffTone::Add);
         assert_eq!(payload, " pager kara");
         assert!(!payload.contains("jj-diff-syntax-highlight"));
+        assert_eq!(removes, vec![(7, "jj-diff-syntax-highlight".into())]);
         assert_eq!(ranges.len(), 1);
         let (s, e, tone) = ranges[0];
         assert_eq!(&payload[s..e], "kara");
         assert_eq!(tone, DiffTone::Add);
+        let shown = stitch_removes(&payload, &removes);
+        assert!(strip_ansi(&shown).contains("jj-diff-syntax-highlightkara"));
+    }
+
+    #[test]
+    fn color_words_keeps_uncolored_after_removed_indent() {
+        // rustfmt-style: only indent spaces are red+underline; code after \x1b[39m is plain
+        let line = " 249  250:             \x1b[4m\x1b[38;5;1m    \x1b[24m\x1b[39mreturn match n {";
+        let (payload, _, removes) = color_words_display_payload(line, 10, false, DiffTone::Add);
+        assert_eq!(payload, "             return match n {");
+        assert_eq!(removes, vec![(13, "    ".into())]);
+        assert_eq!(
+            strip_ansi(&stitch_removes(&payload, &removes)),
+            "                 return match n {"
+        );
     }
 }
