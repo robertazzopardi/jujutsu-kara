@@ -24,6 +24,7 @@ fn main() {
     let mut theme_name =
         std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| "GitHub Dark Default".into());
     let mut no_pager = false;
+    let mut word_underline = false;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -33,6 +34,7 @@ fn main() {
                 theme_name = args.get(i).cloned().unwrap_or(theme_name);
             }
             "--no-pager" => no_pager = true,
+            "--underline" => word_underline = true,
             other if other.starts_with('-') => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -62,17 +64,17 @@ fn main() {
             let diff = unified_diff(&paths[0], &paths[1])?;
             let cursor = io::Cursor::new(diff);
             if use_pager {
-                run_with_pager(cursor, &ps, &theme)
+                run_with_pager(cursor, &ps, &theme, word_underline)
             } else {
-                process(cursor, &mut io::stdout().lock(), &ps, &theme)
+                process(cursor, &mut io::stdout().lock(), &ps, &theme, word_underline)
             }
         } else {
             let stdin = io::stdin();
             let locked = stdin.lock();
             if use_pager {
-                run_with_pager(locked, &ps, &theme)
+                run_with_pager(locked, &ps, &theme, word_underline)
             } else {
-                process(locked, &mut io::stdout().lock(), &ps, &theme)
+                process(locked, &mut io::stdout().lock(), &ps, &theme, word_underline)
             }
         }
     })();
@@ -100,6 +102,7 @@ Also supports git-unified on stdin, and jj --tool LEFT RIGHT (unified only).
 Options:
   --theme NAME   GitHub Dark Default (default), or any two-face name / $JJ_DIFF_THEME
   --no-pager     never spawn less (default when stdout is not a TTY, or tool mode)
+  --underline    re-apply jj word-diff underlines (off by default)
   -h, --help     show this help
 "
     );
@@ -124,17 +127,22 @@ fn stdout_is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
-fn run_with_pager(input: impl BufRead, ps: &SyntaxSet, theme: &Theme) -> io::Result<()> {
+fn run_with_pager(
+    input: impl BufRead,
+    ps: &SyntaxSet,
+    theme: &Theme,
+    word_underline: bool,
+) -> io::Result<()> {
     let mut child = Command::new("less")
         .args(["-FRXK"])
         .stdin(Stdio::piped())
         .spawn()?;
     {
         let mut pipe = child.stdin.take().expect("piped stdin");
-        process(input, &mut pipe, ps, theme)?;
+        process(input, &mut pipe, ps, theme, word_underline)?;
     }
     match child.wait()?.code() {
-        Some(0) | Some(1) | None => Ok(()), // less exits 1 on some quit paths
+        Some(0 | 1) | None => Ok(()), // less exits 1 on some quit paths
         Some(code) => Err(io::Error::other(format!("less exited {code}"))),
     }
 }

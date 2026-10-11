@@ -8,11 +8,11 @@ pub enum DiffTone {
 
 impl DiffTone {
     /// Underline color only (SGR 58) — keeps syntect fg on the text.
-    /// Tuned near ADD_BG/DEL_BG washes, lifted just enough to stay visible.
-    pub fn underline_sgr(self) -> &'static str {
+    /// Tuned near `ADD_BG/DEL_BG` washes, lifted just enough to stay visible.
+    pub const fn underline_sgr(self) -> &'static str {
         match self {
-            DiffTone::Add => "\x1b[4m\x1b[58;2;56;110;72m",
-            DiffTone::Remove => "\x1b[4m\x1b[58;2;140;70;78m",
+            Self::Add => "\x1b[4m\x1b[58;2;56;110;72m",
+            Self::Remove => "\x1b[4m\x1b[58;2;140;70;78m",
         }
     }
 }
@@ -129,17 +129,6 @@ pub fn color_words_display_payload(
     let mut span_tone = fallback;
     let mut chars = original.char_indices().peekable();
 
-    let close_underline = |ranges: &mut Vec<_>,
-                           underlined: &mut bool,
-                           start: usize,
-                           end: usize,
-                           span_tone: DiffTone| {
-        if *underlined && end > start {
-            ranges.push((start, end, span_tone));
-        }
-        *underlined = false;
-    };
-
     while let Some((_, c)) = chars.next() {
         if c == '\u{1b}' {
             match chars.peek().map(|(_, c)| *c) {
@@ -161,36 +150,15 @@ pub fn color_words_display_payload(
                                 span_tone = t;
                             }
                         }
-                        for p in params.split(';') {
-                            match p {
-                                "" | "0" => {
-                                    close_underline(
-                                        &mut ranges,
-                                        &mut underlined,
-                                        start,
-                                        out_i,
-                                        span_tone,
-                                    );
-                                }
-                                "4" => {
-                                    if !underlined {
-                                        start = out_i;
-                                        span_tone = tone;
-                                        underlined = true;
-                                    }
-                                }
-                                "24" | "21" => {
-                                    close_underline(
-                                        &mut ranges,
-                                        &mut underlined,
-                                        start,
-                                        out_i,
-                                        span_tone,
-                                    );
-                                }
-                                _ => {}
-                            }
-                        }
+                        apply_underline_sgr(
+                            &params,
+                            &mut ranges,
+                            &mut underlined,
+                            &mut start,
+                            out_i,
+                            tone,
+                            &mut span_tone,
+                        );
                     }
                 }
                 Some(']') => {
@@ -227,6 +195,43 @@ pub fn color_words_display_payload(
     (payload, ranges)
 }
 
+fn close_underline(
+    ranges: &mut Vec<(usize, usize, DiffTone)>,
+    underlined: &mut bool,
+    start: usize,
+    end: usize,
+    span_tone: DiffTone,
+) {
+    if *underlined && end > start {
+        ranges.push((start, end, span_tone));
+    }
+    *underlined = false;
+}
+
+fn apply_underline_sgr(
+    params: &str,
+    ranges: &mut Vec<(usize, usize, DiffTone)>,
+    underlined: &mut bool,
+    start: &mut usize,
+    out_i: usize,
+    tone: DiffTone,
+    span_tone: &mut DiffTone,
+) {
+    for p in params.split(';') {
+        match p {
+            "" | "0" | "24" | "21" => {
+                close_underline(ranges, underlined, *start, out_i, *span_tone);
+            }
+            "4" if !*underlined => {
+                *start = out_i;
+                *span_tone = tone;
+                *underlined = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn tone_from_sgr(params: &str) -> Option<DiffTone> {
     let parts: Vec<&str> = params.split(';').filter(|p| !p.is_empty()).collect();
     // 31/91 red, 32/92 green
@@ -239,30 +244,26 @@ fn tone_from_sgr(params: &str) -> Option<DiffTone> {
     }
     // 38;5;n — jj defaults: 1 red, 2 green
     if let Some(i) = parts.iter().position(|&p| p == "38") {
-        if parts.get(i + 1) == Some(&"5") {
-            if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+        if parts.get(i + 1) == Some(&"5")
+            && let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
                 return match n {
                     1 | 9 => Some(DiffTone::Remove),
                     2 | 10 => Some(DiffTone::Add),
                     _ => None,
                 };
             }
-        }
-        if parts.get(i + 1) == Some(&"2") {
-            if let (Some(r), Some(g), Some(_b)) = (
+        if parts.get(i + 1) == Some(&"2")
+            && let (Some(r), Some(g), Some(_b)) = (
                 parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
                 parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
                 parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
             ) {
-                return if g > r {
-                    Some(DiffTone::Add)
-                } else if r > g {
-                    Some(DiffTone::Remove)
-                } else {
-                    None
+                return match g.cmp(&r) {
+                    std::cmp::Ordering::Greater => Some(DiffTone::Add),
+                    std::cmp::Ordering::Less => Some(DiffTone::Remove),
+                    std::cmp::Ordering::Equal => None,
                 };
             }
-        }
     }
     None
 }
@@ -292,11 +293,10 @@ pub fn overlay_word_diff(highlighted: &str, ranges: &[(usize, usize, DiffTone)])
                         }
                     }
                     // SGR can clear underline; re-assert style + underline color only.
-                    if final_byte == 'm' {
-                        if let Some(tone) = active {
+                    if final_byte == 'm'
+                        && let Some(tone) = active {
                             out.push_str(tone.underline_sgr());
                         }
-                    }
                 }
                 Some(']') => {
                     out.push(chars.next().unwrap().1);
@@ -305,12 +305,11 @@ pub fn overlay_word_diff(highlighted: &str, ranges: &[(usize, usize, DiffTone)])
                         if c2 == '\u{7}' {
                             break;
                         }
-                        if c2 == '\u{1b}' {
-                            if let Some((_, '\\')) = chars.peek().copied() {
+                        if c2 == '\u{1b}'
+                            && let Some((_, '\\')) = chars.peek().copied() {
                                 out.push(chars.next().unwrap().1);
                                 break;
                             }
-                        }
                     }
                 }
                 Some(_) => {

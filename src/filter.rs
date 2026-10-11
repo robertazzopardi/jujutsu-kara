@@ -25,6 +25,7 @@ pub fn process(
     out: &mut impl Write,
     ps: &SyntaxSet,
     theme: &Theme,
+    word_underline: bool,
 ) -> io::Result<()> {
     let mut mode = Mode::Auto;
     let mut syntax: Option<&SyntaxReference> = None;
@@ -76,11 +77,10 @@ pub fn process(
                     let keep_removes = bg == Some(DEL_BG);
                     let (payload, under) =
                         color_words_display_payload(line, payload_at, keep_removes, fallback);
-                    let mut highlighted = match syntax {
-                        Some(syn) => highlight_payload(ps, theme, syn, &payload),
-                        None => payload,
-                    };
-                    if !under.is_empty() {
+                    let mut highlighted = syntax
+                        .map(|syn| highlight_payload(ps, theme, syn, &payload))
+                        .unwrap_or(payload);
+                    if word_underline && !under.is_empty() {
                         highlighted = overlay_word_diff(&highlighted, &under);
                     }
                     write!(out, "{prefix}")?;
@@ -106,18 +106,19 @@ pub fn process(
                 } else if let Some(marker) = content_marker(&stripped) {
                     let payload_at = marker.len_utf8();
                     let payload = &stripped[payload_at..];
-                    let mut highlighted = match syntax {
-                        Some(syn) => highlight_payload(ps, theme, syn, payload),
-                        None => payload.to_string(),
-                    };
-                    let fallback = match marker {
-                        '+' => DiffTone::Add,
-                        '-' => DiffTone::Remove,
-                        _ => DiffTone::Add,
-                    };
-                    let under = underline_ranges(line, payload_at, fallback);
-                    if !under.is_empty() {
-                        highlighted = overlay_word_diff(&highlighted, &under);
+                    let mut highlighted = syntax.map_or_else(
+                        || payload.to_string(),
+                        |syn| highlight_payload(ps, theme, syn, payload),
+                    );
+                    if word_underline {
+                        let fallback = match marker {
+                            '-' => DiffTone::Remove,
+                            _ => DiffTone::Add,
+                        };
+                        let under = underline_ranges(line, payload_at, fallback);
+                        if !under.is_empty() {
+                            highlighted = overlay_word_diff(&highlighted, &under);
+                        }
                     }
                     write_content(out, marker, &highlighted, had_nl)?;
                 } else {
@@ -180,8 +181,9 @@ fn highlight_payload(
         owned = format!("{payload}\n");
         owned.as_str()
     };
-    match h.highlight_line(line, ps) {
-        Ok(ranges) => {
+    h.highlight_line(line, ps).map_or_else(
+        |_| payload.to_string(),
+        |ranges| {
             let mut s = as_24_bit_terminal_escaped(&ranges[..], false);
             // drop syntect's trailing reset so callers can wrap with diff backgrounds
             if let Some(trimmed) = s.strip_suffix("\x1b[0m") {
@@ -194,9 +196,8 @@ fn highlight_payload(
                 s.pop();
             }
             s
-        }
-        Err(_) => payload.to_string(),
-    }
+        },
+    )
 }
 
 /// Only-left → deleted wash; only-right → added wash; both → context (no wash).
@@ -249,11 +250,7 @@ fn path_from_color_words_header(stripped: &str) -> Option<&str> {
         &s[i + " file ".len()..]
     } else if let Some(rest) = s.strip_prefix("Renamed ") {
         rest
-    } else if let Some(rest) = s.strip_prefix("Copied ") {
-        rest
-    } else {
-        return None;
-    };
+    } else { s.strip_prefix("Copied ")? };
     if path.is_empty() {
         return None;
     }
@@ -323,7 +320,7 @@ fn syntax_for_path<'a>(ps: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxRefere
     let ext = if name == "Cargo.lock" {
         "toml"
     } else {
-        name.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
+        name.rsplit_once('.').map_or("", |(_, e)| e)
     };
     if let Some(syn) = ps.find_syntax_by_extension(ext) {
         return Some(syn);
@@ -338,10 +335,14 @@ mod tests {
     use crate::theme::resolve_theme;
 
     fn run(input: &str) -> String {
+        run_opts(input, false)
+    }
+
+    fn run_opts(input: &str, word_underline: bool) -> String {
         let ps = two_face::syntax::extra_newlines();
         let theme = resolve_theme("GitHub Dark Default");
         let mut out = Vec::new();
-        process(input.as_bytes(), &mut out, &ps, &theme).unwrap();
+        process(input.as_bytes(), &mut out, &ps, &theme, word_underline).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -453,7 +454,7 @@ diff -ruN left/main.rs right/main.rs
 Modified regular file main.rs:
 \x1b[38;5;1m   2\x1b[39m \x1b[38;5;2m   2\x1b[39m:     println!(\"hello\x1b[4m\x1b[38;5;2m world\x1b[24m\x1b[39m\");
 ";
-        let out = run(input);
+        let out = run_opts(input, true);
         assert!(
             out.contains("\x1b[4m"),
             "expected underline preserved:\n{out}"
@@ -466,6 +467,11 @@ Modified regular file main.rs:
         assert!(
             out.contains("\x1b[38;2;"),
             "expected syntect fg kept:\n{out}"
+        );
+        let off = run(input);
+        assert!(
+            !off.contains("\x1b[4m"),
+            "underline off by default:\n{off}"
         );
     }
 

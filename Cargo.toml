@@ -2,6 +2,13 @@
 name = "jujutsu-kara"
 version = "0.1.0"
 edition = "2024"
+authors = ["Rob <robertazzopardi@users.noreply.github.com>"]
+description = "Syntax-highlight code in Jujutsu diffs"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/robertazzopardi/jujutsu-kara"
+keywords = ["jujutsu", "jj", "diff", "syntax-highlighting"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "kara"
