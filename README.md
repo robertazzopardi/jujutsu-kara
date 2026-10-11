@@ -1,6 +1,8 @@
-# jj-diff-syntax-highlight
+# jujutsu-kara
 
 Syntax-highlight **code** in Jujutsu diffs. Headers / line numbers / hunk metadata pass through.
+
+Binary: `kara`.
 
 ## Install
 
@@ -18,19 +20,19 @@ To keep default color-words and only add highlighting, use this as the **pager**
 jj config unset --user ui.diff-formatter   # if you pointed it at this tool
 # leave formatter as :color-words (jj default)
 
-jj config set --user ui.pager jj-diff-syntax-highlight
+jj config set --user ui.pager kara
 ```
 
 One-shot:
 
 ```bash
-jj diff --color=always | jj-diff-syntax-highlight --no-pager
+jj diff --color=always | kara --no-pager
 ```
 
 ## Unified / `--tool` (optional)
 
 ```bash
-jj diff --tool jj-diff-syntax-highlight   # unified only
+jj diff --tool kara   # unified only
 ```
 
 ## Options

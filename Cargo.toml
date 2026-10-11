@@ -1,7 +1,11 @@
 [package]
-name = "jj-diff-syntax-highlight"
+name = "jujutsu-kara"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "kara"
+path = "src/main.rs"
 
 [dependencies]
 serde_json = "1.0.152"

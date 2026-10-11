@@ -39,7 +39,7 @@ fn main() {
     }
 
     if paths.len() > 2 {
-        eprintln!("usage: jj-diff-syntax-highlight [options] [LEFT RIGHT]");
+        eprintln!("usage: kara [options] [LEFT RIGHT]");
         std::process::exit(2);
     }
 
@@ -77,7 +77,7 @@ fn main() {
         if is_broken_pipe(&e) {
             return;
         }
-        eprintln!("jj-diff-syntax-highlight: {e}");
+        eprintln!("kara: {e}");
         std::process::exit(1);
     }
 }
@@ -85,11 +85,11 @@ fn main() {
 fn print_help() {
     print!(
         "\
-jj-diff-syntax-highlight — syntax-highlight code in jj diffs
+kara — syntax-highlight code in jj diffs
 
 Preferred (keeps jj color-words):
   jj config unset --user ui.diff-formatter   # or :color-words
-  jj config set --user ui.pager jj-diff-syntax-highlight
+  jj config set --user ui.pager kara
 
 Also supports git-unified on stdin, and jj --tool LEFT RIGHT (unified only).
 
