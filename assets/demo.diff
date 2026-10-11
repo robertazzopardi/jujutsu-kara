@@ -1,0 +1,12 @@
+Modified regular file src/main.rs:
+   1    1: use std::io::{self, BufRead};
+   2     : 
+        2: use syntect::parsing::SyntaxSet;
+   3    3: 
+   4    4: fn main() {
+   5     :     let theme = "base16-ocean.dark";
+        5:     let theme = "GitHub Dark Default";
+   6    6:     let stdin = io::stdin();
+   7     :     highlight(stdin.lock(), theme);
+        7:     highlight(stdin.lock(), &theme);
+   8    8: }

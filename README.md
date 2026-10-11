@@ -4,6 +4,8 @@ Syntax-highlight **code** in Jujutsu diffs. Headers / line numbers / hunk metada
 
 Binary: `kara`.
 
+![kara highlighting a jj color-words diff](assets/screenshot.png)
+
 ## Install
 
 ```bash
@@ -62,4 +64,4 @@ Added/removed lines get a dark green/red background with syntax colors on top (c
 
 ## License
 
-MIT
+MIT. The embedded default theme is from [primer/github-vscode-theme](https://github.com/primer/github-vscode-theme) (MIT); see `assets/LICENSE-github-vscode-theme`.
