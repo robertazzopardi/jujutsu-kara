@@ -1,2 +1,5 @@
-/target
-docs/superpowers
+/target/
+.DS_Store
+.env
+.env.*
+docs/superpowers/

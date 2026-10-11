@@ -7,8 +7,12 @@ Binary: `kara`.
 ## Install
 
 ```bash
+cargo install --git https://github.com/robertazzopardi/jujutsu-kara
+# or from a local clone:
 cargo install --path .
 ```
+
+Requires Rust 1.85+ (edition 2024).
 
 ## Use with jj (color-words — recommended)
 
@@ -51,6 +55,11 @@ jj diff --tool kara   # unified only
 |---|---|
 | `--theme NAME` | default **GitHub Dark Default** (embedded Primer theme); other [two-face](https://crates.io/crates/two-face) names also work |
 | `--no-pager` | write to stdout (no `less`) |
+| `--underline` | re-apply jj word-diff underlines |
 | `$JJ_DIFF_THEME` | default theme override |
 
 Added/removed lines get a dark green/red background with syntax colors on top (closer to IDE diffs).
+
+## License
+
+MIT
