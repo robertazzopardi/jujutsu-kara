@@ -37,6 +37,8 @@ jj diff --tool jj-diff-syntax-highlight   # unified only
 
 | Flag / env | Meaning |
 |---|---|
-| `--theme NAME` | syntect theme (default `base16-ocean.dark`) |
+| `--theme NAME` | `TwoDark` (default, via [two-face](https://crates.io/crates/two-face)) |
 | `--no-pager` | write to stdout (no `less`) |
 | `$JJ_DIFF_THEME` | default theme override |
+
+Added/removed lines get a dark green/red background with syntax colors on top (closer to IDE diffs).

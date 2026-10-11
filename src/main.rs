@@ -4,9 +4,11 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{Theme, ThemeSet};
+use syntect::highlighting::Theme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
+use two_face::theme::EmbeddedThemeName::Github;
+use two_face::theme::{LazyThemeSet, extra};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,7 +17,7 @@ fn main() {
         return;
     }
 
-    let mut theme_name = std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| "base16-ocean.dark".into());
+    let mut theme_name = std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| Github.to_string());
     let mut no_pager = false;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
@@ -41,15 +43,7 @@ fn main() {
     }
 
     let ps = SyntaxSet::load_defaults_newlines();
-    let ts = ThemeSet::load_defaults();
-    let theme = ts
-        .themes
-        .get(&theme_name)
-        .unwrap_or_else(|| {
-            eprintln!("unknown theme '{theme_name}', falling back to base16-ocean.dark");
-            &ts.themes["base16-ocean.dark"]
-        })
-        .clone();
+    let theme = resolve_theme(&theme_name);
 
     // jj --tool / ui.diff-formatter invokes us with $left $right directories; don't page (jj pages).
     let tool_mode = paths.len() == 2;
@@ -99,20 +93,42 @@ Preferred (keeps jj color-words):
 Also supports git-unified on stdin, and jj --tool LEFT RIGHT (unified only).
 
 Options:
-  --theme NAME   syntect theme (default: base16-ocean.dark, or $JJ_DIFF_THEME)
+  --theme NAME   TwoDark (default) or any two-face theme / $JJ_DIFF_THEME
   --no-pager     never spawn less (default when stdout is not a TTY, or tool mode)
   -h, --help     show this help
 "
     );
 }
 
+/// Dark green / red washes (IDE-style), truecolor.
+const ADD_BG: (u8, u8, u8) = (18, 42, 28);
+const DEL_BG: (u8, u8, u8) = (52, 24, 28);
+
+fn theme_set() -> LazyThemeSet {
+    LazyThemeSet::from(extra())
+}
+
+fn resolve_theme(name: &str) -> Theme {
+    let themes = theme_set();
+    themes.get(name).cloned().unwrap_or_else(|| {
+        eprintln!("unknown theme '{name}', falling back to TwoDark");
+        themes
+            .get("TwoDark")
+            .expect("TwoDark present in two-face")
+            .clone()
+    })
+}
+
+fn sgr_bg((r, g, b): (u8, u8, u8)) -> String {
+    format!("\x1b[48;2;{r};{g};{b}m")
+}
+
 /// jj --tool passes directory trees; produce a unified diff (exit 1 from diff = changes, OK).
 fn unified_diff(left: &str, right: &str) -> io::Result<Vec<u8>> {
-    let output = Command::new("diff")
-        .args(["-ruN", left, right])
-        .output()?;
+    let output = Command::new("diff").args(["-ruN", left, right]).output()?;
     // 0 = identical, 1 = different, 2 = error
-    if output.status.code() == Some(2) || (!output.status.success() && output.status.code() != Some(1))
+    if output.status.code() == Some(2)
+        || (!output.status.success() && output.status.code() != Some(1))
     {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(format!(
@@ -126,11 +142,7 @@ fn stdout_is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
-fn run_with_pager(
-    input: impl BufRead,
-    ps: &SyntaxSet,
-    theme: &Theme,
-) -> io::Result<()> {
+fn run_with_pager(input: impl BufRead, ps: &SyntaxSet, theme: &Theme) -> io::Result<()> {
     let mut child = Command::new("less")
         .args(["-FRXK"])
         .stdin(Stdio::piped())
@@ -170,7 +182,11 @@ fn process(
             break;
         }
         let had_nl = buf.ends_with('\n');
-        let line = if had_nl { &buf[..buf.len() - 1] } else { buf.as_str() };
+        let line = if had_nl {
+            &buf[..buf.len() - 1]
+        } else {
+            buf.as_str()
+        };
         let line = line.strip_suffix('\r').unwrap_or(line);
         let stripped = strip_ansi(line);
 
@@ -197,7 +213,12 @@ fn process(
                         Some(syn) => highlight_payload(ps, theme, syn, payload),
                         None => payload.to_string(),
                     };
-                    write!(out, "{prefix}{highlighted}\x1b[0m")?;
+                    let bg = color_words_line_bg(&stripped);
+                    write!(out, "{prefix}")?;
+                    if let Some(bg) = bg {
+                        write!(out, "{}", sgr_bg(bg))?;
+                    }
+                    write!(out, "{highlighted}\x1b[0m")?;
                     if had_nl {
                         out.write_all(b"\n")?;
                     }
@@ -238,23 +259,39 @@ fn write_raw(out: &mut impl Write, line: &str, had_nl: bool) -> io::Result<()> {
     Ok(())
 }
 
-fn write_content(out: &mut impl Write, marker: char, highlighted: &str, had_nl: bool) -> io::Result<()> {
-    // Marker keeps conventional diff colors; payload is syntax-only.
+fn write_content(
+    out: &mut impl Write,
+    marker: char,
+    highlighted: &str,
+    had_nl: bool,
+) -> io::Result<()> {
+    // IDE-style: full-line wash + marker, syntax colors on the payload.
     match marker {
-        '+' => write!(out, "\x1b[38;5;2m+\x1b[0m{highlighted}")?,
-        '-' => write!(out, "\x1b[38;5;1m-\x1b[0m{highlighted}")?,
-        ' ' => write!(out, " {highlighted}")?,
+        '+' => write!(
+            out,
+            "{}\x1b[38;2;144;190;109m+\x1b[39m{highlighted}\x1b[0m",
+            sgr_bg(ADD_BG)
+        )?,
+        '-' => write!(
+            out,
+            "{}\x1b[38;2;224;108;117m-\x1b[39m{highlighted}\x1b[0m",
+            sgr_bg(DEL_BG)
+        )?,
+        ' ' => write!(out, " {highlighted}\x1b[0m")?,
         _ => unreachable!(),
     }
-    // syntect leaves styles open; reset before newline so the next line is clean
-    out.write_all(b"\x1b[0m")?;
     if had_nl {
         out.write_all(b"\n")?;
     }
     Ok(())
 }
 
-fn highlight_payload(ps: &SyntaxSet, theme: &Theme, syntax: &SyntaxReference, payload: &str) -> String {
+fn highlight_payload(
+    ps: &SyntaxSet,
+    theme: &Theme,
+    syntax: &SyntaxReference,
+    payload: &str,
+) -> String {
     let mut h = HighlightLines::new(syntax, theme);
     // HighlightLines expects a trailing newline for some grammars
     let owned;
@@ -267,16 +304,33 @@ fn highlight_payload(ps: &SyntaxSet, theme: &Theme, syntax: &SyntaxReference, pa
     match h.highlight_line(line, ps) {
         Ok(ranges) => {
             let mut s = as_24_bit_terminal_escaped(&ranges[..], false);
+            // drop syntect's trailing reset so callers can wrap with diff backgrounds
+            if let Some(trimmed) = s.strip_suffix("\x1b[0m") {
+                s = trimmed.to_string();
+            }
             if !payload.ends_with('\n') && s.ends_with('\n') {
                 s.pop();
             }
-            // strip trailing newline escape leftovers
             if s.ends_with('\n') {
                 s.pop();
             }
             s
         }
         Err(_) => payload.to_string(),
+    }
+}
+
+/// Only-left → deleted wash; only-right → added wash; both → context (no wash).
+fn color_words_line_bg(stripped: &str) -> Option<(u8, u8, u8)> {
+    if stripped.len() < 9 {
+        return None;
+    }
+    let left_blank = stripped[..4].bytes().all(|c| c == b' ');
+    let right_blank = stripped[5..9].bytes().all(|c| c == b' ');
+    match (left_blank, right_blank) {
+        (true, false) => Some(ADD_BG),
+        (false, true) => Some(DEL_BG),
+        _ => None,
     }
 }
 
@@ -428,7 +482,9 @@ fn normalize_diff_path(path: &str) -> &str {
 
 fn syntax_for_path<'a>(ps: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
     let name = path.rsplit('/').next().unwrap_or(path);
-    if let Some(syn) = ps.find_syntax_by_extension(name.rsplit_once('.').map(|(_, e)| e).unwrap_or("")) {
+    if let Some(syn) =
+        ps.find_syntax_by_extension(name.rsplit_once('.').map(|(_, e)| e).unwrap_or(""))
+    {
         return Some(syn);
     }
     ps.find_syntax_by_name(name)
@@ -482,15 +538,13 @@ fn is_broken_pipe(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntect::highlighting::ThemeSet;
     use syntect::parsing::SyntaxSet;
 
     fn run(input: &str) -> String {
         let ps = SyntaxSet::load_defaults_newlines();
-        let ts = ThemeSet::load_defaults();
-        let theme = &ts.themes["base16-ocean.dark"];
+        let theme = resolve_theme("TwoDark");
         let mut out = Vec::new();
-        process(input.as_bytes(), &mut out, &ps, theme).unwrap();
+        process(input.as_bytes(), &mut out, &ps, &theme).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -515,7 +569,10 @@ mod tests {
             "\x1b[1m+++ b/main.rs\x1b[0m",
             "\x1b[38;5;6m@@ -1,2 +1,2 @@\x1b[39m",
         ] {
-            assert!(out.contains(header), "missing passthrough {header:?}\n{out}");
+            assert!(
+                out.contains(header),
+                "missing passthrough {header:?}\n{out}"
+            );
         }
     }
 
@@ -530,10 +587,18 @@ diff --git a/main.rs b/main.rs
 +fn new() {}
 ";
         let out = run(input);
-        // syntect 24-bit truecolor escapes
-        assert!(out.contains("\x1b[38;2;"), "expected syntect truecolor in:\n{out}");
-        assert!(out.contains("\x1b[38;5;2m+"), "expected green + marker");
-        assert!(out.contains("\x1b[38;5;1m-"), "expected red - marker");
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected syntect truecolor in:\n{out}"
+        );
+        assert!(
+            out.contains(&sgr_bg(ADD_BG)),
+            "expected add background:\n{out}"
+        );
+        assert!(
+            out.contains(&sgr_bg(DEL_BG)),
+            "expected del background:\n{out}"
+        );
     }
 
     #[test]
@@ -548,7 +613,10 @@ diff -ruN left/main.rs right/main.rs
 ";
         let out = run(input);
         assert!(out.contains("diff -ruN left/main.rs right/main.rs"));
-        assert!(out.contains("\x1b[38;2;"), "expected syntect truecolor in:\n{out}");
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected syntect truecolor in:\n{out}"
+        );
     }
 
     #[test]
@@ -564,8 +632,14 @@ diff -ruN left/main.rs right/main.rs
             out.contains("\x1b[38;5;3mModified regular file main.rs:\x1b[39m"),
             "header must pass through:\n{out}"
         );
-        assert!(out.contains("\x1b[38;2;"), "expected syntect on code:\n{out}");
-        assert!(out.contains("   1    1:"), "line-number prefix kept:\n{out}");
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected syntect on code:\n{out}"
+        );
+        assert!(
+            out.contains("   1    1:"),
+            "line-number prefix kept:\n{out}"
+        );
     }
 
     #[test]
