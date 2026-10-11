@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+serde_json = "1.0.152"
 syntect = "5.3.0"
 two-face = "0.5.2"
+vscode-theme-syntect = "0.1.1"

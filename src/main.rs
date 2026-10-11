@@ -7,8 +7,8 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::Theme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
-use two_face::theme::EmbeddedThemeName::Github;
 use two_face::theme::{LazyThemeSet, extra};
+use vscode_theme_syntect::parse_vscode_theme;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -17,7 +17,8 @@ fn main() {
         return;
     }
 
-    let mut theme_name = std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| Github.to_string());
+    let mut theme_name =
+        std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| "GitHub Dark Default".into());
     let mut no_pager = false;
     let mut paths: Vec<String> = Vec::new();
     let mut i = 0;
@@ -93,7 +94,7 @@ Preferred (keeps jj color-words):
 Also supports git-unified on stdin, and jj --tool LEFT RIGHT (unified only).
 
 Options:
-  --theme NAME   TwoDark (default) or any two-face theme / $JJ_DIFF_THEME
+  --theme NAME   GitHub Dark Default (default), or any two-face name / $JJ_DIFF_THEME
   --no-pager     never spawn less (default when stdout is not a TTY, or tool mode)
   -h, --help     show this help
 "
@@ -108,14 +109,32 @@ fn theme_set() -> LazyThemeSet {
     LazyThemeSet::from(extra())
 }
 
+/// Primer GitHub Dark Default — always dark fg/bg token colors (truecolor), independent of terminal theme.
+fn github_dark_default() -> Theme {
+    let vs = parse_vscode_theme(include_str!("../assets/github-dark-default.json"))
+        .expect("embedded GitHub Dark Default JSON");
+    Theme::try_from(vs).expect("convert GitHub Dark Default to syntect")
+}
+
+fn is_github_dark_alias(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "github"
+            | "github dark"
+            | "github dark default"
+            | "github-dark"
+            | "github-dark-default"
+    )
+}
+
 fn resolve_theme(name: &str) -> Theme {
+    if is_github_dark_alias(name) {
+        return github_dark_default();
+    }
     let themes = theme_set();
     themes.get(name).cloned().unwrap_or_else(|| {
-        eprintln!("unknown theme '{name}', falling back to TwoDark");
-        themes
-            .get("TwoDark")
-            .expect("TwoDark present in two-face")
-            .clone()
+        eprintln!("unknown theme '{name}', falling back to GitHub Dark Default");
+        github_dark_default()
     })
 }
 
@@ -542,7 +561,7 @@ mod tests {
 
     fn run(input: &str) -> String {
         let ps = SyntaxSet::load_defaults_newlines();
-        let theme = resolve_theme("TwoDark");
+        let theme = resolve_theme("GitHub Dark Default");
         let mut out = Vec::new();
         process(input.as_bytes(), &mut out, &ps, &theme).unwrap();
         String::from_utf8(out).unwrap()

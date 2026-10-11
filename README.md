@@ -37,7 +37,7 @@ jj diff --tool jj-diff-syntax-highlight   # unified only
 
 | Flag / env | Meaning |
 |---|---|
-| `--theme NAME` | `TwoDark` (default, via [two-face](https://crates.io/crates/two-face)) |
+| `--theme NAME` | default **GitHub Dark Default** (embedded Primer theme); other [two-face](https://crates.io/crates/two-face) names also work |
 | `--no-pager` | write to stdout (no `less`) |
 | `$JJ_DIFF_THEME` | default theme override |
 
