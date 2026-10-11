@@ -43,7 +43,7 @@ fn main() {
         std::process::exit(2);
     }
 
-    let ps = SyntaxSet::load_defaults_newlines();
+    let ps = two_face::syntax::extra_newlines();
     let theme = resolve_theme(&theme_name);
 
     // jj --tool / ui.diff-formatter invokes us with $left $right directories; don't page (jj pages).
@@ -223,22 +223,25 @@ fn process(
             Mode::ColorWords => {
                 if let Some(payload_at) = color_words_payload_at(&stripped) {
                     let (prefix, _) = split_ansi_at_stripped(line, payload_at);
-                    let payload = &stripped[payload_at..];
-                    let mut highlighted = match syntax {
-                        Some(syn) => highlight_payload(ps, theme, syn, payload),
-                        None => payload.to_string(),
-                    };
+                    let bg = color_words_line_bg(&stripped);
                     // Keep jj word-diff marks: underline + red/green (not harsh syntax colors).
-                    let fallback = match color_words_line_bg(&stripped) {
+                    let fallback = match bg {
                         Some(bg) if bg == ADD_BG => DiffTone::Add,
                         Some(_) => DiffTone::Remove,
                         None => DiffTone::Add,
                     };
-                    let under = underline_ranges(line, payload_at, fallback);
+                    // Delete-only lines are all "removed"; dual-sided lines inline old+new —
+                    // drop removed tokens so syntect sees valid right-side text.
+                    let keep_removes = bg == Some(DEL_BG);
+                    let (payload, under) =
+                        color_words_display_payload(line, payload_at, keep_removes, fallback);
+                    let mut highlighted = match syntax {
+                        Some(syn) => highlight_payload(ps, theme, syn, &payload),
+                        None => payload,
+                    };
                     if !under.is_empty() {
                         highlighted = overlay_word_diff(&highlighted, &under);
                     }
-                    let bg = color_words_line_bg(&stripped);
                     write!(out, "{prefix}")?;
                     if let Some(bg) = bg {
                         write!(out, "{}", sgr_bg(bg))?;
@@ -461,24 +464,36 @@ fn underline_ranges(
     payload_at: usize,
     fallback: DiffTone,
 ) -> Vec<(usize, usize, DiffTone)> {
-    underline_ranges_abs(original, fallback)
-        .into_iter()
-        .filter_map(|(s, e, tone)| {
-            let s = s.max(payload_at);
-            let e = e.max(payload_at);
-            (e > s).then_some((s - payload_at, e - payload_at, tone))
-        })
-        .collect()
+    color_words_display_payload(original, payload_at, true, fallback).1
 }
 
-fn underline_ranges_abs(original: &str, fallback: DiffTone) -> Vec<(usize, usize, DiffTone)> {
+/// Payload text + underline ranges for color-words lines.
+///
+/// jj word-replacements emit removed then added tokens inline. When `keep_removes`
+/// is false (dual-sided / add-only), skip removed-tone chars so highlighting sees
+/// the right-hand line (`…highlight` + `kara` → `kara`).
+fn color_words_display_payload(
+    original: &str,
+    payload_at: usize,
+    keep_removes: bool,
+    fallback: DiffTone,
+) -> (String, Vec<(usize, usize, DiffTone)>) {
+    let mut payload = String::new();
     let mut ranges = Vec::new();
-    let mut plain = 0usize;
+    let mut plain = 0usize; // all plain chars (incl. skipped)
+    let mut out_i = 0usize; // kept payload chars only
     let mut underlined = false;
     let mut start = 0usize;
     let mut tone = fallback;
     let mut span_tone = fallback;
     let mut chars = original.char_indices().peekable();
+
+    let close_underline = |ranges: &mut Vec<_>, underlined: &mut bool, start: usize, end: usize, span_tone: DiffTone| {
+        if *underlined && end > start {
+            ranges.push((start, end, span_tone));
+        }
+        *underlined = false;
+    };
 
     while let Some((_, c)) = chars.next() {
         if c == '\u{1b}' {
@@ -504,23 +519,17 @@ fn underline_ranges_abs(original: &str, fallback: DiffTone) -> Vec<(usize, usize
                         for p in params.split(';') {
                             match p {
                                 "" | "0" => {
-                                    if underlined {
-                                        ranges.push((start, plain, span_tone));
-                                        underlined = false;
-                                    }
+                                    close_underline(&mut ranges, &mut underlined, start, out_i, span_tone);
                                 }
                                 "4" => {
                                     if !underlined {
-                                        start = plain;
+                                        start = out_i;
                                         span_tone = tone;
                                         underlined = true;
                                     }
                                 }
                                 "24" | "21" => {
-                                    if underlined {
-                                        ranges.push((start, plain, span_tone));
-                                        underlined = false;
-                                    }
+                                    close_underline(&mut ranges, &mut underlined, start, out_i, span_tone);
                                 }
                                 _ => {}
                             }
@@ -546,12 +555,19 @@ fn underline_ranges_abs(original: &str, fallback: DiffTone) -> Vec<(usize, usize
             }
             continue;
         }
+        let in_payload = plain >= payload_at;
         plain += 1;
+        if !in_payload {
+            continue;
+        }
+        if !keep_removes && tone == DiffTone::Remove {
+            continue;
+        }
+        payload.push(c);
+        out_i += 1;
     }
-    if underlined {
-        ranges.push((start, plain, span_tone));
-    }
-    ranges
+    close_underline(&mut ranges, &mut underlined, start, out_i, span_tone);
+    (payload, ranges)
 }
 
 fn tone_from_sgr(params: &str) -> Option<DiffTone> {
@@ -755,9 +771,13 @@ fn normalize_diff_path(path: &str) -> &str {
 
 fn syntax_for_path<'a>(ps: &'a SyntaxSet, path: &str) -> Option<&'a SyntaxReference> {
     let name = path.rsplit('/').next().unwrap_or(path);
-    if let Some(syn) =
-        ps.find_syntax_by_extension(name.rsplit_once('.').map(|(_, e)| e).unwrap_or(""))
-    {
+    // Cargo.lock is TOML; syntect/two-face don't register the .lock extension.
+    let ext = if name == "Cargo.lock" {
+        "toml"
+    } else {
+        name.rsplit_once('.').map(|(_, e)| e).unwrap_or("")
+    };
+    if let Some(syn) = ps.find_syntax_by_extension(ext) {
         return Some(syn);
     }
     ps.find_syntax_by_name(name)
@@ -811,10 +831,9 @@ fn is_broken_pipe(e: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use syntect::parsing::SyntaxSet;
 
     fn run(input: &str) -> String {
-        let ps = SyntaxSet::load_defaults_newlines();
+        let ps = two_face::syntax::extra_newlines();
         let theme = resolve_theme("GitHub Dark Default");
         let mut out = Vec::new();
         process(input.as_bytes(), &mut out, &ps, &theme).unwrap();
@@ -954,6 +973,32 @@ Modified regular file main.rs:
         let (s, e, tone) = ranges[0];
         assert_eq!(&payload[s..e], " world");
         assert_eq!(tone, DiffTone::Add);
+    }
+
+    #[test]
+    fn color_words_drops_removed_half_of_word_replace() {
+        // jj inlines old (red) + new (green) under one underline
+        let line = "   1    1: pager \x1b[4m\x1b[38;5;1mjj-diff-syntax-highlight\x1b[38;5;2mkara\x1b[24m\x1b[39m";
+        let (payload, ranges) = color_words_display_payload(line, 10, false, DiffTone::Add);
+        assert_eq!(payload, " pager kara");
+        assert!(!payload.contains("jj-diff-syntax-highlight"));
+        assert_eq!(ranges.len(), 1);
+        let (s, e, tone) = ranges[0];
+        assert_eq!(&payload[s..e], "kara");
+        assert_eq!(tone, DiffTone::Add);
+    }
+
+    #[test]
+    fn toml_lines_get_syntax_ansi() {
+        let input = "\
+Modified regular file Cargo.toml:
+   1    1: name = \"kara\"
+";
+        let out = run(input);
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected syntect on toml:\n{out}"
+        );
     }
 
     #[test]
