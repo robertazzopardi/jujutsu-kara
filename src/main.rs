@@ -119,11 +119,7 @@ fn github_dark_default() -> Theme {
 fn is_github_dark_alias(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "github"
-            | "github dark"
-            | "github dark default"
-            | "github-dark"
-            | "github-dark-default"
+        "github" | "github dark" | "github dark default" | "github-dark" | "github-dark-default"
     )
 }
 
@@ -228,10 +224,20 @@ fn process(
                 if let Some(payload_at) = color_words_payload_at(&stripped) {
                     let (prefix, _) = split_ansi_at_stripped(line, payload_at);
                     let payload = &stripped[payload_at..];
-                    let highlighted = match syntax {
+                    let mut highlighted = match syntax {
                         Some(syn) => highlight_payload(ps, theme, syn, payload),
                         None => payload.to_string(),
                     };
+                    // Keep jj word-diff marks: underline + red/green (not harsh syntax colors).
+                    let fallback = match color_words_line_bg(&stripped) {
+                        Some(bg) if bg == ADD_BG => DiffTone::Add,
+                        Some(_) => DiffTone::Remove,
+                        None => DiffTone::Add,
+                    };
+                    let under = underline_ranges(line, payload_at, fallback);
+                    if !under.is_empty() {
+                        highlighted = overlay_word_diff(&highlighted, &under);
+                    }
                     let bg = color_words_line_bg(&stripped);
                     write!(out, "{prefix}")?;
                     if let Some(bg) = bg {
@@ -254,11 +260,21 @@ fn process(
                 } else if is_passthrough_git_line(&stripped) {
                     write_raw(out, line, had_nl)?;
                 } else if let Some(marker) = content_marker(&stripped) {
-                    let payload = &stripped[marker.len_utf8()..];
-                    let highlighted = match syntax {
+                    let payload_at = marker.len_utf8();
+                    let payload = &stripped[payload_at..];
+                    let mut highlighted = match syntax {
                         Some(syn) => highlight_payload(ps, theme, syn, payload),
                         None => payload.to_string(),
                     };
+                    let fallback = match marker {
+                        '+' => DiffTone::Add,
+                        '-' => DiffTone::Remove,
+                        _ => DiffTone::Add,
+                    };
+                    let under = underline_ranges(line, payload_at, fallback);
+                    if !under.is_empty() {
+                        highlighted = overlay_word_diff(&highlighted, &under);
+                    }
                     write_content(out, marker, &highlighted, had_nl)?;
                 } else {
                     write_raw(out, line, had_nl)?;
@@ -420,6 +436,244 @@ fn color_words_payload_at(stripped: &str) -> Option<usize> {
         return None;
     }
     Some(10)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiffTone {
+    Add,
+    Remove,
+}
+
+impl DiffTone {
+    /// Underline color only (SGR 58) — keeps syntect fg on the text.
+    /// Tuned near ADD_BG/DEL_BG washes, lifted just enough to stay visible.
+    fn underline_sgr(self) -> &'static str {
+        match self {
+            DiffTone::Add => "\x1b[4m\x1b[58;2;56;110;72m",
+            DiffTone::Remove => "\x1b[4m\x1b[58;2;140;70;78m",
+        }
+    }
+}
+
+/// Plain-char ranges `[start, end)` relative to `payload_at` that jj underlined.
+fn underline_ranges(
+    original: &str,
+    payload_at: usize,
+    fallback: DiffTone,
+) -> Vec<(usize, usize, DiffTone)> {
+    underline_ranges_abs(original, fallback)
+        .into_iter()
+        .filter_map(|(s, e, tone)| {
+            let s = s.max(payload_at);
+            let e = e.max(payload_at);
+            (e > s).then_some((s - payload_at, e - payload_at, tone))
+        })
+        .collect()
+}
+
+fn underline_ranges_abs(original: &str, fallback: DiffTone) -> Vec<(usize, usize, DiffTone)> {
+    let mut ranges = Vec::new();
+    let mut plain = 0usize;
+    let mut underlined = false;
+    let mut start = 0usize;
+    let mut tone = fallback;
+    let mut span_tone = fallback;
+    let mut chars = original.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.peek().map(|(_, c)| *c) {
+                Some('[') => {
+                    chars.next();
+                    let mut params = String::new();
+                    let mut final_byte = 'm';
+                    for (_, c2) in chars.by_ref() {
+                        if ('@'..='~').contains(&c2) {
+                            final_byte = c2;
+                            break;
+                        }
+                        params.push(c2);
+                    }
+                    if final_byte == 'm' {
+                        if let Some(t) = tone_from_sgr(&params) {
+                            tone = t;
+                            if underlined {
+                                span_tone = t;
+                            }
+                        }
+                        for p in params.split(';') {
+                            match p {
+                                "" | "0" => {
+                                    if underlined {
+                                        ranges.push((start, plain, span_tone));
+                                        underlined = false;
+                                    }
+                                }
+                                "4" => {
+                                    if !underlined {
+                                        start = plain;
+                                        span_tone = tone;
+                                        underlined = true;
+                                    }
+                                }
+                                "24" | "21" => {
+                                    if underlined {
+                                        ranges.push((start, plain, span_tone));
+                                        underlined = false;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some((_, c2)) = chars.next() {
+                        if c2 == '\u{7}' {
+                            break;
+                        }
+                        if c2 == '\u{1b}' && chars.peek().map(|(_, c)| *c) == Some('\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+            continue;
+        }
+        plain += 1;
+    }
+    if underlined {
+        ranges.push((start, plain, span_tone));
+    }
+    ranges
+}
+
+fn tone_from_sgr(params: &str) -> Option<DiffTone> {
+    let parts: Vec<&str> = params.split(';').filter(|p| !p.is_empty()).collect();
+    // 31/91 red, 32/92 green
+    for p in &parts {
+        match *p {
+            "31" | "91" => return Some(DiffTone::Remove),
+            "32" | "92" => return Some(DiffTone::Add),
+            _ => {}
+        }
+    }
+    // 38;5;n — jj defaults: 1 red, 2 green
+    if let Some(i) = parts.iter().position(|&p| p == "38") {
+        if parts.get(i + 1) == Some(&"5") {
+            if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+                return match n {
+                    1 | 9 => Some(DiffTone::Remove),
+                    2 | 10 => Some(DiffTone::Add),
+                    _ => None,
+                };
+            }
+        }
+        if parts.get(i + 1) == Some(&"2") {
+            if let (Some(r), Some(g), Some(_b)) = (
+                parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()),
+                parts.get(i + 3).and_then(|s| s.parse::<u8>().ok()),
+                parts.get(i + 4).and_then(|s| s.parse::<u8>().ok()),
+            ) {
+                return if g > r {
+                    Some(DiffTone::Add)
+                } else if r > g {
+                    Some(DiffTone::Remove)
+                } else {
+                    None
+                };
+            }
+        }
+    }
+    None
+}
+
+/// Colored underline on jj word-diff spans; syntect foreground stays as-is.
+fn overlay_word_diff(highlighted: &str, ranges: &[(usize, usize, DiffTone)]) -> String {
+    if ranges.is_empty() {
+        return highlighted.to_string();
+    }
+    let mut out = String::with_capacity(highlighted.len() + ranges.len() * 16);
+    let mut plain = 0usize;
+    let mut active: Option<DiffTone> = None;
+    let mut chars = highlighted.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c == '\u{1b}' {
+            out.push(c);
+            match chars.peek().map(|(_, c)| *c) {
+                Some('[') => {
+                    out.push(chars.next().unwrap().1);
+                    let mut final_byte = 'm';
+                    for (_, c2) in chars.by_ref() {
+                        out.push(c2);
+                        if ('@'..='~').contains(&c2) {
+                            final_byte = c2;
+                            break;
+                        }
+                    }
+                    // SGR can clear underline; re-assert style + underline color only.
+                    if final_byte == 'm' {
+                        if let Some(tone) = active {
+                            out.push_str(tone.underline_sgr());
+                        }
+                    }
+                }
+                Some(']') => {
+                    out.push(chars.next().unwrap().1);
+                    while let Some((_, c2)) = chars.next() {
+                        out.push(c2);
+                        if c2 == '\u{7}' {
+                            break;
+                        }
+                        if c2 == '\u{1b}' {
+                            if let Some((_, '\\')) = chars.peek().copied() {
+                                out.push(chars.next().unwrap().1);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    out.push(chars.next().unwrap().1);
+                }
+                None => {}
+            }
+            continue;
+        }
+        let want = ranges
+            .iter()
+            .find(|&&(s, e, _)| plain >= s && plain < e)
+            .map(|&(_, _, t)| t);
+        match (active, want) {
+            (None, Some(tone)) => {
+                out.push_str(tone.underline_sgr());
+                active = Some(tone);
+            }
+            (Some(_), None) => {
+                out.push_str("\x1b[24m\x1b[59m"); // underline off + default underline color
+                active = None;
+            }
+            (Some(a), Some(b)) if a != b => {
+                out.push_str("\x1b[24m\x1b[59m");
+                out.push_str(b.underline_sgr());
+                active = Some(b);
+            }
+            _ => {}
+        }
+        out.push(c);
+        plain += 1;
+    }
+    if active.is_some() {
+        out.push_str("\x1b[24m\x1b[59m");
+    }
+    out
 }
 
 /// Split `original` so the left part covers the first `plain_len` non-ANSI chars.
@@ -666,6 +920,40 @@ diff -ruN left/main.rs right/main.rs
         assert_eq!(color_words_payload_at("   1    1: fn main() {"), Some(10));
         assert_eq!(color_words_payload_at("        2:     println!"), Some(10));
         assert_eq!(color_words_payload_at("Modified regular file x:"), None);
+    }
+
+    #[test]
+    fn preserves_jj_token_underlines() {
+        // payload starts at col 10; " world" is underlined + green by jj
+        let input = "\
+Modified regular file main.rs:
+\x1b[38;5;1m   2\x1b[39m \x1b[38;5;2m   2\x1b[39m:     println!(\"hello\x1b[4m\x1b[38;5;2m world\x1b[24m\x1b[39m\");
+";
+        let out = run(input);
+        assert!(
+            out.contains("\x1b[4m"),
+            "expected underline preserved:\n{out}"
+        );
+        assert!(
+            out.contains("\x1b[58;2;56;110;72m"),
+            "expected muted green underline color:\n{out}"
+        );
+        // syntax color on the payload should still appear (not replaced by solid green word)
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "expected syntect fg kept:\n{out}"
+        );
+    }
+
+    #[test]
+    fn underline_ranges_detects_jj_span() {
+        let line = "   2    2:     println!(\"hello\x1b[4m\x1b[38;5;2m world\x1b[24m\x1b[39m\");";
+        let ranges = underline_ranges(line, 10, DiffTone::Add);
+        assert!(!ranges.is_empty(), "ranges={ranges:?}");
+        let payload = "     println!(\"hello world\");";
+        let (s, e, tone) = ranges[0];
+        assert_eq!(&payload[s..e], " world");
+        assert_eq!(tone, DiffTone::Add);
     }
 
     #[test]
