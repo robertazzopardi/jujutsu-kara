@@ -8,7 +8,7 @@ name = "kara"
 path = "src/main.rs"
 
 [dependencies]
-serde_json = "1.0.152"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 syntect = "5.3.0"
 two-face = "0.5.2"
-vscode-theme-syntect = "0.1.1"

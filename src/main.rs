@@ -1,5 +1,7 @@
 //! Filter: syntax-highlight code payloads in git-unified diffs; leave everything else alone.
 
+mod vscode_theme;
+
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
 
@@ -8,7 +10,6 @@ use syntect::highlighting::Theme;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 use two_face::theme::{LazyThemeSet, extra};
-use vscode_theme_syntect::parse_vscode_theme;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -111,9 +112,8 @@ fn theme_set() -> LazyThemeSet {
 
 /// Primer GitHub Dark Default — always dark fg/bg token colors (truecolor), independent of terminal theme.
 fn github_dark_default() -> Theme {
-    let vs = parse_vscode_theme(include_str!("../assets/github-dark-default.json"))
-        .expect("embedded GitHub Dark Default JSON");
-    Theme::try_from(vs).expect("convert GitHub Dark Default to syntect")
+    vscode_theme::theme_from_json(include_str!("../assets/github-dark-default.json"))
+        .expect("embedded GitHub Dark Default JSON")
 }
 
 fn is_github_dark_alias(name: &str) -> bool {
