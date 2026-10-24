@@ -55,9 +55,11 @@ jj diff --tool kara   # unified only
 
 | Flag / env | Meaning |
 |---|---|
-| `--theme NAME` | default **GitHub Dark Default** (embedded Primer theme); other [two-face](https://crates.io/crates/two-face) names also work |
+| `--theme NAME` (or `--theme=NAME`) | default **GitHub Dark Default** (embedded Primer theme); other [two-face](https://crates.io/crates/two-face) names also work |
 | `--no-pager` | write to stdout (no `less`) |
 | `--underline` | re-apply jj word-diff underlines |
+| `--` | treat everything after it as a path |
+| `-V`, `--version` | print version |
 | `$JJ_DIFF_THEME` | default theme override |
 
 Added/removed lines get a dark green/red background with syntax colors on top (closer to IDE diffs).

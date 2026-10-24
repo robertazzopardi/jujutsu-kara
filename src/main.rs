@@ -1,6 +1,7 @@
 //! Filter: syntax-highlight code payloads in git-unified diffs; leave everything else alone.
 
 mod ansi;
+mod cli;
 mod filter;
 mod theme;
 mod vscode_theme;
@@ -15,83 +16,11 @@ use filter::process;
 use theme::resolve_theme;
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        print_help();
-        return;
-    }
-
-    let mut theme_name =
-        std::env::var("JJ_DIFF_THEME").unwrap_or_else(|_| "GitHub Dark Default".into());
-    let mut no_pager = false;
-    let mut word_underline = false;
-    let mut paths: Vec<String> = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--theme" => {
-                i += 1;
-                theme_name = args.get(i).cloned().unwrap_or(theme_name);
-            }
-            "--no-pager" => no_pager = true,
-            "--underline" => word_underline = true,
-            other if other.starts_with('-') => {
-                eprintln!("unknown argument: {other}");
-                std::process::exit(2);
-            }
-            other => paths.push(other.to_string()),
-        }
-        i += 1;
-    }
-
-    if paths.len() > 2 {
-        eprintln!("usage: kara [options] [LEFT RIGHT]");
-        std::process::exit(2);
-    }
-
+    let cli = cli::parse(std::env::args().skip(1));
     let ps = two_face::syntax::extra_newlines();
-    let theme = resolve_theme(&theme_name);
+    let theme = resolve_theme(&cli.theme);
 
-    // jj --tool / ui.diff-formatter invokes us with $left $right directories; don't page (jj pages).
-    let tool_mode = paths.len() == 2;
-    if tool_mode {
-        no_pager = true;
-    }
-    let use_pager = !no_pager && stdout_is_tty();
-
-    let result = (|| -> io::Result<()> {
-        if tool_mode {
-            let diff = unified_diff(&paths[0], &paths[1])?;
-            let cursor = io::Cursor::new(diff);
-            if use_pager {
-                run_with_pager(cursor, &ps, &theme, word_underline)
-            } else {
-                process(
-                    cursor,
-                    &mut io::stdout().lock(),
-                    &ps,
-                    &theme,
-                    word_underline,
-                )
-            }
-        } else {
-            let stdin = io::stdin();
-            let locked = stdin.lock();
-            if use_pager {
-                run_with_pager(locked, &ps, &theme, word_underline)
-            } else {
-                process(
-                    locked,
-                    &mut io::stdout().lock(),
-                    &ps,
-                    &theme,
-                    word_underline,
-                )
-            }
-        }
-    })();
-
-    if let Err(e) = result {
+    if let Err(e) = run(&cli, &ps, &theme) {
         if is_broken_pipe(&e) {
             return;
         }
@@ -100,24 +29,22 @@ fn main() {
     }
 }
 
-fn print_help() {
-    print!(
-        "\
-kara — syntax-highlight code in jj diffs
+/// Read the diff (from `LEFT RIGHT` dirs, or stdin) and highlight it to stdout or `less`.
+fn run(cli: &cli::Args, ps: &SyntaxSet, theme: &Theme) -> io::Result<()> {
+    // jj --tool / ui.diff-formatter invokes us with $left $right directories; don't page (jj pages).
+    let use_pager = !cli.tool_mode() && !cli.no_pager && stdout_is_tty();
 
-Preferred (keeps jj color-words):
-  jj config unset --user ui.diff-formatter   # or :color-words
-  jj config set --user ui.pager kara
+    let input: Box<dyn BufRead> = if cli.tool_mode() {
+        Box::new(io::Cursor::new(unified_diff(&cli.paths[0], &cli.paths[1])?))
+    } else {
+        Box::new(io::stdin().lock())
+    };
 
-Also supports git-unified on stdin, and jj --tool LEFT RIGHT (unified only).
-
-Options:
-  --theme NAME   GitHub Dark Default (default), or any two-face name / $JJ_DIFF_THEME
-  --no-pager     never spawn less (default when stdout is not a TTY, or tool mode)
-  --underline    re-apply jj word-diff underlines (off by default)
-  -h, --help     show this help
-"
-    );
+    if use_pager {
+        run_with_pager(input, ps, theme, cli.underline)
+    } else {
+        process(input, &mut io::stdout().lock(), ps, theme, cli.underline)
+    }
 }
 
 /// jj --tool passes directory trees; produce a unified diff (exit 1 from diff = changes, OK).
