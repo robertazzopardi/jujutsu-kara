@@ -20,6 +20,18 @@ enum Mode {
     ColorWords,
 }
 
+/// One input line, split for output (keep CR) and matching (strip CR + ANSI).
+struct Line<'a> {
+    /// Original line, including a trailing `\r` if present.
+    raw: &'a str,
+    /// Line without a trailing `\r` (used for classification and highlighting).
+    plain: &'a str,
+    /// `plain` with ANSI escapes removed.
+    stripped: &'a str,
+    had_cr: bool,
+    had_nl: bool,
+}
+
 pub fn process(
     mut input: impl BufRead,
     out: &mut impl Write,
@@ -29,6 +41,9 @@ pub fn process(
 ) -> io::Result<()> {
     let mut mode = Mode::Auto;
     let mut syntax: Option<&SyntaxReference> = None;
+    // True once we're inside a `@@` hunk, so `--- `/`+++ ` content lines aren't
+    // mistaken for file headers.
+    let mut in_hunk = false;
     // ponytail: per-line HighlightLines loses multi-line state; dual old/new stacks if that bites
     let mut buf = String::new();
 
@@ -39,76 +54,68 @@ pub fn process(
             break;
         }
         let had_nl = buf.ends_with('\n');
-        let line = if had_nl {
+        // Keep the CR for output (passthrough must stay byte-identical), but
+        // strip it for classification/highlighting.
+        let raw = if had_nl {
             &buf[..buf.len() - 1]
         } else {
             buf.as_str()
         };
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        let stripped = strip_ansi(line);
+        let had_cr = raw.ends_with('\r');
+        let plain = raw.strip_suffix('\r').unwrap_or(raw);
+        let stripped = strip_ansi(plain);
+        let l = Line {
+            raw,
+            plain,
+            stripped: &stripped,
+            had_cr,
+            had_nl,
+        };
 
-        if stripped.starts_with("diff ") {
+        if l.stripped.starts_with("diff ") {
             mode = Mode::Git;
-            syntax = path_from_diff_header(&stripped).and_then(|p| syntax_for_path(ps, &p));
-            write_raw(out, line, had_nl)?;
+            in_hunk = false;
+            syntax = path_from_diff_header(l.stripped).and_then(|p| syntax_for_path(ps, &p));
+            write_raw(out, l.raw, l.had_nl)?;
             continue;
         }
 
-        if let Some(path) = path_from_color_words_header(&stripped) {
+        if let Some(path) = path_from_color_words_header(l.stripped) {
             mode = Mode::ColorWords;
             syntax = syntax_for_path(ps, path);
-            write_raw(out, line, had_nl)?;
+            write_raw(out, l.raw, l.had_nl)?;
             continue;
+        }
+
+        // Bare unified diffs (`diff -u`, no `diff ` line) still have `+++`/`@@`.
+        if mode == Mode::Auto
+            && (l.stripped.starts_with("@@") || path_from_plus_header(l.stripped).is_some())
+        {
+            mode = Mode::Git;
         }
 
         match mode {
             Mode::ColorWords => {
-                if let Some(payload_at) = color_words_payload_at(&stripped) {
-                    let (prefix, _) = split_ansi_at_stripped(line, payload_at);
-                    let bg = color_words_line_bg(&stripped);
-                    // Keep jj word-diff marks: underline + red/green (not harsh syntax colors).
-                    let fallback = match bg {
-                        Some(bg) if bg == ADD_BG => DiffTone::Add,
-                        Some(_) => DiffTone::Remove,
-                        None => DiffTone::Add,
-                    };
-                    // Delete-only: keep removes in payload. Dual/add: syntect on right side,
-                    // then stitch removed (before) tokens back for inline before/after.
-                    let keep_removes = bg == Some(DEL_BG);
-                    let (payload, under, removes) =
-                        color_words_display_payload(line, payload_at, keep_removes, fallback);
-                    let mut highlighted = syntax
-                        .map(|syn| highlight_payload(ps, theme, syn, &payload))
-                        .unwrap_or(payload);
-                    if word_underline && !under.is_empty() {
-                        highlighted = overlay_word_diff(&highlighted, &under);
-                    }
-                    if !removes.is_empty() {
-                        highlighted = stitch_removes(&highlighted, &removes);
-                    }
-                    write!(out, "{prefix}")?;
-                    if let Some(bg) = bg {
-                        write!(out, "{}", sgr_bg(bg))?;
-                    }
-                    write!(out, "{highlighted}\x1b[0m")?;
-                    if had_nl {
-                        out.write_all(b"\n")?;
-                    }
+                if let Some(payload_at) = color_words_payload_at(l.stripped) {
+                    write_color_words_line(out, &l, payload_at, syntax, ps, theme, word_underline)?;
                 } else {
-                    write_raw(out, line, had_nl)?;
+                    write_raw(out, l.raw, l.had_nl)?;
                 }
             }
             Mode::Git => {
-                if stripped.starts_with("+++ ") {
-                    if let Some(p) = path_from_plus_header(&stripped) {
+                if l.stripped.starts_with("@@") {
+                    in_hunk = true;
+                    write_raw(out, l.raw, l.had_nl)?;
+                } else if !in_hunk && l.stripped.starts_with("+++ ") {
+                    if let Some(p) = path_from_plus_header(l.stripped) {
                         syntax = syntax_for_path(ps, &p);
                     }
-                    write_raw(out, line, had_nl)?;
-                } else if is_passthrough_git_line(&stripped) {
-                    write_raw(out, line, had_nl)?;
-                } else if let Some(marker) = content_marker(&stripped) {
+                    write_raw(out, l.raw, l.had_nl)?;
+                } else if !in_hunk && is_passthrough_git_line(l.stripped) {
+                    write_raw(out, l.raw, l.had_nl)?;
+                } else if let Some(marker) = content_marker(l.stripped) {
                     let payload_at = marker.len_utf8();
-                    let payload = &stripped[payload_at..];
+                    let payload = &l.stripped[payload_at..];
                     let mut highlighted = syntax.map_or_else(
                         || payload.to_string(),
                         |syn| highlight_payload(ps, theme, syn, payload),
@@ -118,20 +125,70 @@ pub fn process(
                             '-' => DiffTone::Remove,
                             _ => DiffTone::Add,
                         };
-                        let under = underline_ranges(line, payload_at, fallback);
+                        let under = underline_ranges(l.plain, payload_at, fallback);
                         if !under.is_empty() {
                             highlighted = overlay_word_diff(&highlighted, &under);
                         }
                     }
-                    write_content(out, marker, &highlighted, had_nl)?;
+                    write_content(out, marker, &highlighted, l.had_cr, l.had_nl)?;
                 } else {
-                    write_raw(out, line, had_nl)?;
+                    write_raw(out, l.raw, l.had_nl)?;
                 }
             }
-            Mode::Auto => write_raw(out, line, had_nl)?,
+            Mode::Auto => write_raw(out, l.raw, l.had_nl)?,
         }
     }
     out.flush()
+}
+
+/// Highlight a single color-words payload line and write it with its wash.
+fn write_color_words_line(
+    out: &mut impl Write,
+    l: &Line<'_>,
+    payload_at: usize,
+    syntax: Option<&SyntaxReference>,
+    ps: &SyntaxSet,
+    theme: &Theme,
+    word_underline: bool,
+) -> io::Result<()> {
+    let (prefix, _) = split_ansi_at_stripped(l.plain, payload_at);
+    let bg = color_words_line_bg(l.stripped);
+    // Keep jj word-diff marks: underline + red/green (not harsh syntax colors).
+    let fallback = match bg {
+        Some(bg) if bg == ADD_BG => DiffTone::Add,
+        Some(_) => DiffTone::Remove,
+        None => DiffTone::Add,
+    };
+    // Delete-only: keep removes in payload. Dual/add: syntect on right side,
+    // then stitch removed (before) tokens back for inline before/after.
+    let keep_removes = bg == Some(DEL_BG);
+    let (payload, under, removes) =
+        color_words_display_payload(l.plain, payload_at, keep_removes, fallback);
+    let mut highlighted = syntax
+        .map(|syn| highlight_payload(ps, theme, syn, &payload))
+        .unwrap_or(payload);
+    if word_underline && !under.is_empty() {
+        highlighted = overlay_word_diff(&highlighted, &under);
+    }
+    if !removes.is_empty() {
+        highlighted = stitch_removes(&highlighted, &removes);
+    }
+    write!(out, "{prefix}")?;
+    if let Some(bg) = bg {
+        write!(out, "{}", sgr_bg(bg))?;
+    }
+    write!(out, "{highlighted}\x1b[0m")?;
+    write_line_ending(out, l.had_cr, l.had_nl)
+}
+
+fn write_line_ending(out: &mut impl Write, had_cr: bool, had_nl: bool) -> io::Result<()> {
+    if had_cr {
+        out.write_all(b"\r")?;
+    }
+    if had_nl {
+        out.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn write_raw(out: &mut impl Write, line: &str, had_nl: bool) -> io::Result<()> {
@@ -146,6 +203,7 @@ fn write_content(
     out: &mut impl Write,
     marker: char,
     highlighted: &str,
+    had_cr: bool,
     had_nl: bool,
 ) -> io::Result<()> {
     // IDE-style: full-line wash + marker, syntax colors on the payload.
@@ -163,10 +221,7 @@ fn write_content(
         ' ' => write!(out, " {highlighted}\x1b[0m")?,
         _ => unreachable!(),
     }
-    if had_nl {
-        out.write_all(b"\n")?;
-    }
-    Ok(())
+    write_line_ending(out, had_cr, had_nl)
 }
 
 fn highlight_payload(
@@ -205,11 +260,15 @@ fn highlight_payload(
 
 /// Only-left → deleted wash; only-right → added wash; both → context (no wash).
 fn color_words_line_bg(stripped: &str) -> Option<(u8, u8, u8)> {
-    if stripped.len() < 9 {
-        return None;
-    }
-    let left_blank = stripped[..4].bytes().all(|c| c == b' ');
-    let right_blank = stripped[5..9].bytes().all(|c| c == b' ');
+    let prefix = stripped.get(..color_words_colon(stripped)?)?;
+    let bytes = prefix.as_bytes();
+    // jj right-aligns each column, so a present number ends in a digit.
+    let right_blank = !bytes.last().is_some_and(u8::is_ascii_digit);
+    let right_start = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_digit())
+        .map_or(0, |i| i + 1);
+    let left_blank = bytes[..right_start].iter().all(|b| *b == b' ');
     match (left_blank, right_blank) {
         (true, false) => Some(ADD_BG),
         (false, true) => Some(DEL_BG),
@@ -218,13 +277,8 @@ fn color_words_line_bg(stripped: &str) -> Option<(u8, u8, u8)> {
 }
 
 fn content_marker(stripped: &str) -> Option<char> {
-    let mut chars = stripped.chars();
-    let c = chars.next()?;
-    matches!(c, ' ' | '+' | '-').then_some(c).filter(|_| {
-        // avoid treating "+++ b/file" / "--- a/file" as content (already handled)
-        // and "diff " etc.
-        true
-    })
+    let c = stripped.chars().next()?;
+    matches!(c, ' ' | '+' | '-').then_some(c)
 }
 
 fn is_passthrough_git_line(stripped: &str) -> bool {
@@ -246,7 +300,11 @@ fn is_passthrough_git_line(stripped: &str) -> bool {
         || stripped.starts_with("\\ No newline")
 }
 
-/// `Modified regular file path:` / `Added … file path:` / renames `old => new:`
+/// `Modified regular file path:` / `Added … file path:` / renames.
+///
+/// jj renders renames/copies as `Modified regular file new (old => new):`, so
+/// strip the trailing `(old => new)` annotation; older output used
+/// `Renamed old => new:`.
 fn path_from_color_words_header(stripped: &str) -> Option<&str> {
     let s = stripped.strip_suffix(':')?;
     let path = if let Some(i) = s.find(" file ") {
@@ -259,6 +317,11 @@ fn path_from_color_words_header(stripped: &str) -> Option<&str> {
     if path.is_empty() {
         return None;
     }
+    // "new (old => new)" — keep only the new path.
+    let path = match path.rfind(" (") {
+        Some(open) if path[open..].contains(" => ") && path.ends_with(')') => &path[..open],
+        _ => path,
+    };
     // "old.rs => new.rs"
     Some(match path.rsplit_once(" => ") {
         Some((_, new)) => new,
@@ -266,22 +329,27 @@ fn path_from_color_words_header(stripped: &str) -> Option<&str> {
     })
 }
 
-/// Fixed-width jj color-words columns: `LLLL RRRR:` then code payload.
+/// Offset of the `:` that terminates jj's line-number columns, if this is a
+/// color-words line.
+///
+/// jj writes `{left:>4} {right:>4}: ` but each `{:>4}` is a *minimum* width, so
+/// columns widen past 9999 (e.g. `10016 10016: `). Parse the colon instead of
+/// assuming fixed offsets.
+fn color_words_colon(stripped: &str) -> Option<usize> {
+    let colon = stripped.find(':')?;
+    let prefix = stripped.as_bytes().get(..colon)?;
+    if !prefix.iter().any(u8::is_ascii_digit) {
+        return None;
+    }
+    if !prefix.iter().all(|b| b.is_ascii_digit() || *b == b' ') {
+        return None;
+    }
+    Some(colon)
+}
+
+/// Byte offset of the code payload on a color-words line (the space after `:`).
 fn color_words_payload_at(stripped: &str) -> Option<usize> {
-    let b = stripped.as_bytes();
-    if b.len() < 10 || b[4] != b' ' || b[9] != b':' {
-        return None;
-    }
-    let left = &stripped[..4];
-    let right = &stripped[5..9];
-    let ok = |col: &str| col.chars().all(|c| c.is_ascii_digit() || c == ' ');
-    if !ok(left) || !ok(right) {
-        return None;
-    }
-    if left.bytes().all(|c| c == b' ') && right.bytes().all(|c| c == b' ') {
-        return None;
-    }
-    Some(10)
+    Some(color_words_colon(stripped)? + 1)
 }
 
 fn path_from_diff_header(stripped: &str) -> Option<String> {
@@ -488,5 +556,153 @@ Modified regular file Cargo.toml:
             out.contains("\x1b[38;2;"),
             "expected syntect on toml:\n{out}"
         );
+    }
+
+    #[test]
+    fn content_lines_shaped_like_headers_are_highlighted() {
+        // A removed SQL comment `-- old` renders as `--- old`, colliding with
+        // the `--- a/file` file header; an added `++ x` renders as `+++ x`.
+        let input = "\
+diff --git a/x.sql b/x.sql
+--- a/x.sql
++++ b/x.sql
+@@ -1,2 +1,2 @@
+--- old comment
++SELECT 1;
+ SELECT 2;
+";
+        let out = run(input);
+        let removed = out
+            .lines()
+            .find(|l| l.contains("old comment"))
+            .expect("removed line present");
+        assert!(
+            removed.contains(&sgr_bg(DEL_BG)),
+            "removed line lost its wash:\n{out}"
+        );
+        assert!(
+            removed.contains("\x1b[38;2;"),
+            "removed line lost syntax colors:\n{out}"
+        );
+    }
+
+    #[test]
+    fn added_plus_line_does_not_clear_syntax() {
+        // Added `++ added` renders as `+++ added`; it must not be read as a
+        // `+++ b/file` header (which would reset syntax for the rest of file).
+        let input = "\
+diff --git a/x.js b/x.js
+--- a/x.js
++++ b/x.js
+@@ -1,2 +1,4 @@
+ fn a() {}
++++ added
++let q = 9;
+ fn b() {}
+";
+        let out = run(input);
+        let added = out
+            .lines()
+            .find(|l| l.contains("added"))
+            .expect("added line present");
+        assert!(
+            added.contains(&sgr_bg(ADD_BG)),
+            "added line lost wash:\n{out}"
+        );
+        let context = out
+            .lines()
+            .find(|l| strip_ansi(l).contains("fn b"))
+            .expect("context line present");
+        assert!(
+            context.contains("\x1b[38;2;"),
+            "syntax state was reset after `+++` content line:\n{out}"
+        );
+    }
+
+    #[test]
+    fn rename_header_keeps_syntax() {
+        let input = "\
+Modified regular file new.rs (old.rs => new.rs):
+   1    1: fn main() {}
+";
+        let out = run(input);
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "rename annotation cleared the syntax:\n{out}"
+        );
+    }
+
+    #[test]
+    fn crlf_line_endings_preserved() {
+        let input = "diff --git a/x.rs b/x.rs\r\n--- a/x.rs\r\n+++ b/x.rs\r\n@@ -1 +1 @@\r\n-let a = 1;\r\n+let a = 2;\r\n";
+        let out = run(input);
+        assert!(
+            out.contains("diff --git a/x.rs b/x.rs\r\n"),
+            "passthrough CRLF lost:\n{out:?}"
+        );
+        assert!(out.contains("--- a/x.rs\r\n"), "header CRLF lost:\n{out:?}");
+        assert!(out.contains("\x1b[0m\r\n"), "content CRLF lost:\n{out:?}");
+        assert!(out.ends_with("\r\n"), "final CRLF lost:\n{out:?}");
+    }
+
+    #[test]
+    fn bare_unified_diff_is_highlighted() {
+        // No `diff ` line (plain `diff -u` output) still gets highlighted.
+        let input = "\
+--- a/x.rs
++++ b/x.rs
+@@ -1 +1 @@
+-fn old() {}
++fn new() {}
+";
+        let out = run(input);
+        assert!(
+            out.contains("\x1b[38;2;"),
+            "bare unified diff not highlighted:\n{out}"
+        );
+        assert!(out.contains(&sgr_bg(ADD_BG)), "no add wash:\n{out}");
+        assert!(out.contains(&sgr_bg(DEL_BG)), "no del wash:\n{out}");
+    }
+
+    #[test]
+    fn color_words_wide_line_numbers() {
+        let input = "\
+Modified regular file big.rs:
+    ...
+10018 10018: fn a() {}
+10019     : fn b() {}
+     10019: fn c() {}
+";
+        let out = run(input);
+        let deleted = out
+            .lines()
+            .find(|l| strip_ansi(l).contains("fn b"))
+            .unwrap();
+        assert!(
+            deleted.contains(&sgr_bg(DEL_BG)),
+            "wide deleted line lost wash:\n{out}"
+        );
+        let added = out
+            .lines()
+            .find(|l| strip_ansi(l).contains("fn c"))
+            .unwrap();
+        assert!(
+            added.contains(&sgr_bg(ADD_BG)),
+            "wide added line lost wash:\n{out}"
+        );
+        assert!(
+            added.contains("\x1b[38;2;"),
+            "wide columns stopped syntax highlighting:\n{out}"
+        );
+    }
+
+    #[test]
+    fn color_words_columns_wide() {
+        assert_eq!(color_words_payload_at("10016 10016: let x"), Some(12));
+        assert_eq!(color_words_payload_at("10019     : let x"), Some(11));
+        assert_eq!(color_words_payload_at("     10019: let x"), Some(11));
+        assert_eq!(color_words_line_bg("10016 10016: x"), None);
+        assert_eq!(color_words_line_bg("10019     : x"), Some(DEL_BG));
+        assert_eq!(color_words_line_bg("     10019: x"), Some(ADD_BG));
     }
 }

@@ -48,10 +48,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Args {
         } else if let Some(value) = arg.strip_prefix("--theme=") {
             theme = value.to_string();
         } else if arg == "--theme" {
-            theme = match args.next() {
-                Some(value) => value,
-                None => usage_error("--theme requires a value"),
-            };
+            theme = args
+                .next()
+                .unwrap_or_else(|| usage_error("--theme requires a value"));
         } else if arg == "--no-pager" {
             no_pager = true;
         } else if arg == "--underline" {
