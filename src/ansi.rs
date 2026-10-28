@@ -217,14 +217,17 @@ pub fn stitch_removes(highlighted: &str, removes: &[(usize, String)]) -> String 
     );
     let mut plain = 0usize;
     let mut ri = 0usize;
+    let mut active_fg: Option<String> = None;
     let mut chars = highlighted.char_indices().peekable();
 
-    let flush = |out: &mut String, at: usize, ri: &mut usize| {
+    let flush_inserts = |out: &mut String, at: usize, ri: &mut usize, fg: &Option<String>| {
         while *ri < removes.len() && removes[*ri].0 == at {
-            // jj default remove: underline + red fg
             out.push_str("\x1b[4m\x1b[38;5;1m");
             out.push_str(&removes[*ri].1);
-            out.push_str("\x1b[24m\x1b[39m");
+            out.push_str("\x1b[24m");
+            if let Some(seq) = fg {
+                out.push_str(seq);
+            }
             *ri += 1;
         }
     };
@@ -235,11 +238,18 @@ pub fn stitch_removes(highlighted: &str, removes: &[(usize, String)]) -> String 
             match chars.peek().map(|(_, c)| *c) {
                 Some('[') => {
                     out.push(chars.next().unwrap().1);
+                    let mut params = String::new();
+                    let mut final_byte = 'm';
                     for (_, c2) in chars.by_ref() {
                         out.push(c2);
                         if ('@'..='~').contains(&c2) {
+                            final_byte = c2;
                             break;
                         }
+                        params.push(c2);
+                    }
+                    if final_byte == 'm' {
+                        apply_fg_sgr(&params, &mut active_fg);
                     }
                 }
                 Some(']') => {
@@ -262,12 +272,33 @@ pub fn stitch_removes(highlighted: &str, removes: &[(usize, String)]) -> String 
             }
             continue;
         }
-        flush(&mut out, plain, &mut ri);
+        flush_inserts(&mut out, plain, &mut ri, &active_fg);
         out.push(c);
         plain += 1;
     }
-    flush(&mut out, plain, &mut ri);
+    flush_inserts(&mut out, plain, &mut ri, &active_fg);
     out
+}
+
+/// Shift jj underline ranges after [`stitch_removes`] inserts text at plain offsets.
+pub fn shift_underline_ranges_for_removes(
+    ranges: &[(usize, usize, DiffTone)],
+    removes: &[(usize, String)],
+) -> Vec<(usize, usize, DiffTone)> {
+    if removes.is_empty() {
+        return ranges.to_vec();
+    }
+    ranges
+        .iter()
+        .map(|&(s, e, t)| {
+            let shift: usize = removes
+                .iter()
+                .filter(|(i, _)| *i <= s)
+                .map(|(_, text)| text.len())
+                .sum();
+            (s + shift, e + shift, t)
+        })
+        .collect()
 }
 
 fn close_underline(
@@ -309,6 +340,38 @@ fn apply_underline_sgr(
 
 fn sgr_clears_fg(params: &str) -> bool {
     params.is_empty() || params.split(';').any(|p| p == "0" || p == "39")
+}
+
+/// Full SGR sequence for a foreground-only CSI `params` (without ESC prefix).
+fn fg_sgr_sequence(params: &str) -> Option<String> {
+    if sgr_clears_fg(params) {
+        return None;
+    }
+    let parts: Vec<&str> = params.split(';').filter(|p| !p.is_empty()).collect();
+    if parts.first() == Some(&"38") {
+        if parts.get(1) == Some(&"2") && parts.len() >= 5 {
+            return Some(format!("\x1b[{params}m"));
+        }
+        if parts.get(1) == Some(&"5") && parts.len() >= 3 {
+            return Some(format!("\x1b[{params}m"));
+        }
+    }
+    for p in &parts {
+        if matches!(*p, "30" | "31" | "32" | "33" | "34" | "35" | "36" | "37" | "90" | "91" | "92" | "93" | "94" | "95" | "96" | "97") {
+            return Some(format!("\x1b[{params}m"));
+        }
+    }
+    None
+}
+
+fn apply_fg_sgr(params: &str, active: &mut Option<String>) {
+    if sgr_clears_fg(params) {
+        *active = None;
+        return;
+    }
+    if let Some(seq) = fg_sgr_sequence(params) {
+        *active = Some(seq);
+    }
 }
 
 fn tone_from_sgr(params: &str) -> Option<DiffTone> {
@@ -467,6 +530,36 @@ mod tests {
         assert_eq!(tone, DiffTone::Add);
         let shown = stitch_removes(&payload, &removes);
         assert!(strip_ansi(&shown).contains("jj-diff-syntax-highlightkara"));
+    }
+
+    #[test]
+    fn color_words_word_replace_shorter() {
+        let line = "   1    1: let x = \"\x1b[4m\x1b[38;5;1mexampleExample\x1b[38;5;2mexample\x1b[24m\x1b[39m\";";
+        let (payload, ranges, removes) =
+            color_words_display_payload(line, 10, false, DiffTone::Add);
+        assert_eq!(payload, " let x = \"example\";");
+        assert_eq!(removes, vec![(10, "exampleExample".into())]);
+        let (s, e, tone) = ranges[0];
+        assert_eq!(&payload[s..e], "example");
+        assert_eq!(tone, DiffTone::Add);
+        let shown = stitch_removes(&payload, &removes);
+        assert_eq!(
+            strip_ansi(&shown),
+            " let x = \"exampleExampleexample\";"
+        );
+    }
+
+    #[test]
+    fn stitch_removes_restores_active_syntax_fg() {
+        let highlighted = "\x1b[38;2;165;214;255mexample";
+        let removes = vec![(0, "OLD".into())];
+        let out = stitch_removes(highlighted, &removes);
+        assert_eq!(strip_ansi(&out), "OLDexample");
+        let after_old = out.split("OLD").nth(1).expect("removed text");
+        assert!(
+            after_old.starts_with("\x1b[24m\x1b[38;2;165;214;255mexample"),
+            "kept suffix lost string fg: {after_old:?}"
+        );
     }
 
     #[test]

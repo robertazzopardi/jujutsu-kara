@@ -8,8 +8,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::as_24_bit_terminal_escaped;
 
 use crate::ansi::{
-    DiffTone, color_words_display_payload, overlay_word_diff, split_ansi_at_stripped,
-    stitch_removes, strip_ansi, underline_ranges,
+    DiffTone, color_words_display_payload, overlay_word_diff, shift_underline_ranges_for_removes,
+    split_ansi_at_stripped, stitch_removes, strip_ansi, underline_ranges,
 };
 use crate::theme::{ADD_BG, DEL_BG, sgr_bg};
 
@@ -32,19 +32,19 @@ struct Line<'a> {
     had_nl: bool,
 }
 
-pub fn process(
+pub fn process<'a>(
     mut input: impl BufRead,
     out: &mut impl Write,
-    ps: &SyntaxSet,
-    theme: &Theme,
+    ps: &'a SyntaxSet,
+    theme: &'a Theme,
     word_underline: bool,
 ) -> io::Result<()> {
     let mut mode = Mode::Auto;
-    let mut syntax: Option<&SyntaxReference> = None;
+    let mut syntax: Option<&'a SyntaxReference> = None;
     // True once we're inside a `@@` hunk, so `--- `/`+++ ` content lines aren't
     // mistaken for file headers.
     let mut in_hunk = false;
-    // ponytail: per-line HighlightLines loses multi-line state; dual old/new stacks if that bites
+    let mut highlight: Option<DiffHighlight<'a>> = None;
     let mut buf = String::new();
 
     loop {
@@ -76,6 +76,7 @@ pub fn process(
             mode = Mode::Git;
             in_hunk = false;
             syntax = path_from_diff_header(l.stripped).and_then(|p| syntax_for_path(ps, &p));
+            reset_highlight(&mut highlight, syntax, theme);
             write_raw(out, l.raw, l.had_nl)?;
             continue;
         }
@@ -83,6 +84,7 @@ pub fn process(
         if let Some(path) = path_from_color_words_header(l.stripped) {
             mode = Mode::ColorWords;
             syntax = syntax_for_path(ps, path);
+            reset_highlight(&mut highlight, syntax, theme);
             write_raw(out, l.raw, l.had_nl)?;
             continue;
         }
@@ -97,7 +99,16 @@ pub fn process(
         match mode {
             Mode::ColorWords => {
                 if let Some(payload_at) = color_words_payload_at(l.stripped) {
-                    write_color_words_line(out, &l, payload_at, syntax, ps, theme, word_underline)?;
+                    write_color_words_line(
+                        out,
+                        &l,
+                        payload_at,
+                        syntax,
+                        ps,
+                        theme,
+                        word_underline,
+                        &mut highlight,
+                    )?;
                 } else {
                     write_raw(out, l.raw, l.had_nl)?;
                 }
@@ -109,6 +120,7 @@ pub fn process(
                 } else if !in_hunk && l.stripped.starts_with("+++ ") {
                     if let Some(p) = path_from_plus_header(l.stripped) {
                         syntax = syntax_for_path(ps, &p);
+                        reset_highlight(&mut highlight, syntax, theme);
                     }
                     write_raw(out, l.raw, l.had_nl)?;
                 } else if !in_hunk && is_passthrough_git_line(l.stripped) {
@@ -116,9 +128,19 @@ pub fn process(
                 } else if let Some(marker) = content_marker(l.stripped) {
                     let payload_at = marker.len_utf8();
                     let payload = &l.stripped[payload_at..];
-                    let mut highlighted = syntax.map_or_else(
-                        || payload.to_string(),
-                        |syn| highlight_payload(ps, theme, syn, payload),
+                    let side = match marker {
+                        '-' => HighlightSide::Old,
+                        '+' => HighlightSide::New,
+                        ' ' => HighlightSide::Both,
+                        _ => unreachable!(),
+                    };
+                    let mut highlighted = highlight_for(
+                        &mut highlight,
+                        syntax,
+                        theme,
+                        ps,
+                        side,
+                        payload,
                     );
                     if word_underline {
                         let fallback = match marker {
@@ -141,15 +163,70 @@ pub fn process(
     out.flush()
 }
 
+struct DiffHighlight<'a> {
+    old: HighlightLines<'a>,
+    new: HighlightLines<'a>,
+}
+
+impl<'a> DiffHighlight<'a> {
+    fn new(syntax: &'a SyntaxReference, theme: &'a Theme) -> Self {
+        Self {
+            old: HighlightLines::new(syntax, theme),
+            new: HighlightLines::new(syntax, theme),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HighlightSide {
+    Old,
+    New,
+    Both,
+}
+
+fn reset_highlight<'a>(
+    slot: &mut Option<DiffHighlight<'a>>,
+    syntax: Option<&'a SyntaxReference>,
+    theme: &'a Theme,
+) {
+    *slot = syntax.map(|syn| DiffHighlight::new(syn, theme));
+}
+
+fn highlight_for<'a>(
+    slot: &mut Option<DiffHighlight<'a>>,
+    syntax: Option<&'a SyntaxReference>,
+    theme: &'a Theme,
+    ps: &SyntaxSet,
+    side: HighlightSide,
+    payload: &str,
+) -> String {
+    let Some(syn) = syntax else {
+        return payload.to_string();
+    };
+    if slot.is_none() {
+        *slot = Some(DiffHighlight::new(syn, theme));
+    }
+    let state = slot.as_mut().expect("highlight slot");
+    match side {
+        HighlightSide::Old => highlight_line_payload(&mut state.old, ps, payload),
+        HighlightSide::New => highlight_line_payload(&mut state.new, ps, payload),
+        HighlightSide::Both => {
+            let _ = highlight_line_payload(&mut state.old, ps, payload);
+            highlight_line_payload(&mut state.new, ps, payload)
+        }
+    }
+}
+
 /// Highlight a single color-words payload line and write it with its wash.
-fn write_color_words_line(
+fn write_color_words_line<'a>(
     out: &mut impl Write,
     l: &Line<'_>,
     payload_at: usize,
-    syntax: Option<&SyntaxReference>,
+    syntax: Option<&'a SyntaxReference>,
     ps: &SyntaxSet,
-    theme: &Theme,
+    theme: &'a Theme,
     word_underline: bool,
+    highlight: &mut Option<DiffHighlight<'a>>,
 ) -> io::Result<()> {
     let (prefix, _) = split_ansi_at_stripped(l.plain, payload_at);
     let bg = color_words_line_bg(l.stripped);
@@ -164,14 +241,20 @@ fn write_color_words_line(
     let keep_removes = bg == Some(DEL_BG);
     let (payload, under, removes) =
         color_words_display_payload(l.plain, payload_at, keep_removes, fallback);
-    let mut highlighted = syntax
-        .map(|syn| highlight_payload(ps, theme, syn, &payload))
-        .unwrap_or(payload);
-    if word_underline && !under.is_empty() {
-        highlighted = overlay_word_diff(&highlighted, &under);
-    }
+    let inline_change = !removes.is_empty() || !under.is_empty();
+    let side = match bg {
+        Some(bg) if bg == DEL_BG => HighlightSide::Old,
+        Some(_) => HighlightSide::New,
+        None if inline_change => HighlightSide::New,
+        None => HighlightSide::Both,
+    };
+    let mut highlighted = highlight_for(highlight, syntax, theme, ps, side, &payload);
     if !removes.is_empty() {
         highlighted = stitch_removes(&highlighted, &removes);
+    }
+    if word_underline && !under.is_empty() {
+        let under = shift_underline_ranges_for_removes(&under, &removes);
+        highlighted = overlay_word_diff(&highlighted, &under);
     }
     write!(out, "{prefix}")?;
     if let Some(bg) = bg {
@@ -224,14 +307,7 @@ fn write_content(
     write_line_ending(out, had_cr, had_nl)
 }
 
-fn highlight_payload(
-    ps: &SyntaxSet,
-    theme: &Theme,
-    syntax: &SyntaxReference,
-    payload: &str,
-) -> String {
-    let mut h = HighlightLines::new(syntax, theme);
-    // HighlightLines expects a trailing newline for some grammars
+fn highlight_line_payload(h: &mut HighlightLines, ps: &SyntaxSet, payload: &str) -> String {
     let owned;
     let line = if payload.ends_with('\n') {
         payload
@@ -243,7 +319,6 @@ fn highlight_payload(
         |_| payload.to_string(),
         |ranges| {
             let mut s = as_24_bit_terminal_escaped(&ranges[..], false);
-            // drop syntect's trailing reset so callers can wrap with diff backgrounds
             if let Some(trimmed) = s.strip_suffix("\x1b[0m") {
                 s = trimmed.to_string();
             }
@@ -693,6 +768,77 @@ Modified regular file big.rs:
         assert!(
             added.contains("\x1b[38;2;"),
             "wide columns stopped syntax highlighting:\n{out}"
+        );
+    }
+
+    #[test]
+    fn color_words_inline_word_replace_keeps_syntax() {
+        let input = "\
+Modified regular file foo.rs:
+\x1b[38;5;1m   1\x1b[39m \x1b[38;5;2m   1\x1b[39m: let x = \"\x1b[4m\x1b[38;5;1mexampleExample\x1b[38;5;2mexample\x1b[24m\x1b[39m\";
+";
+        let out = run(input);
+        let line = out.lines().nth(1).expect("diff line");
+        let plain = strip_ansi(line);
+        assert!(
+            plain.contains("exampleExampleexample"),
+            "jj inline remove+add text missing:\n{plain}\n{out}"
+        );
+        // String literal color must survive past the stitched removed token.
+        let after_removed = line.split("exampleExample").nth(1).expect("removed span");
+        assert!(
+            after_removed.starts_with("\x1b[24m\x1b[38;2;165;214;255mexample"),
+            "string syntax color lost on kept token after inline remove:\n{out}"
+        );
+    }
+
+    #[test]
+    fn color_words_middle_of_string_replace_keeps_prefix_suffix_colors() {
+        let input = "\
+Modified regular file foo.rs:
+\x1b[38;5;1m   3\x1b[39m \x1b[38;5;2m   3\x1b[39m:     let y = \"\x1b[4m\x1b[38;5;1mprefixExampleSuffix\x1b[38;5;2mprefixsuffix\x1b[24m\x1b[39m\";
+";
+        let out = run(input);
+        let line = out.lines().nth(1).expect("diff line");
+        let after_removed = line.split("prefixExampleSuffix").nth(1).expect("removed span");
+        assert!(
+            after_removed.starts_with("\x1b[24m\x1b[38;2;165;214;255mprefixsuffix"),
+            "suffix lost string fg:\n{out}"
+        );
+    }
+
+    #[test]
+    fn color_words_inline_word_replace_keeps_underline() {
+        let input = "\
+Modified regular file foo.rs:
+\x1b[38;5;1m   1\x1b[39m \x1b[38;5;2m   1\x1b[39m: let x = \"\x1b[4m\x1b[38;5;1mexampleExample\x1b[38;5;2mexample\x1b[24m\x1b[39m\";
+";
+        let out = run_opts(input, true);
+        let line = out.lines().nth(1).expect("diff line");
+        assert!(
+            line.contains("\x1b[58;2;56;110;72m"),
+            "add underline missing on kept token after stitch:\n{out}"
+        );
+    }
+
+    #[test]
+    fn color_words_multiline_state_keeps_comment_highlight() {
+        let input = "\
+Modified regular file foo.rs:
+   1    1: fn demo() {
+   2    2:     /* start
+        3:     still comment */
+   3    4:     let x = \"\x1b[4m\x1b[38;5;1mexampleExample\x1b[38;5;2mexample\x1b[24m\x1b[39m\";
+   4    5: }
+";
+        let out = run(input);
+        let comment = out
+            .lines()
+            .find(|l| strip_ansi(l).contains("still comment"))
+            .expect("comment continuation line");
+        assert!(
+            comment.contains("\x1b[38;2;"),
+            "comment line lost syntax colors:\n{out}"
         );
     }
 
